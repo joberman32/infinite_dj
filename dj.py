@@ -28,6 +28,7 @@ from infinite_dj.mixer import (
     best_cue_out, best_cue_in,
 )
 from infinite_dj.engine import StreamEngine
+from infinite_dj.sequencer import sequence_energy_arc
 
 SUPPORTED_FORMATS = (".mp3", ".flac", ".wav", ".aiff", ".aif", ".ogg", ".m4a")
 
