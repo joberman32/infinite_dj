@@ -1,0 +1,236 @@
+"""
+Track sequencer — Phase 2.
+
+Builds a weighted compatibility graph over all analyzed tracks and
+finds an ordered sequence for mixing. Supports:
+  - Greedy: always pick the best next track
+  - Energy arc: shape the set toward a target energy curve
+  - Avoid repeats: configurable cooldown window
+"""
+
+import random
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict
+import numpy as np
+
+from .models import TrackMeta
+from .harmony import camelot_compatibility, bpm_compatibility
+
+
+@dataclass
+class CompatibilityEdge:
+    track_a: str   # file_path
+    track_b: str
+    harmonic: float
+    rhythmic: float
+    score: float   # weighted composite
+
+
+@dataclass
+class Sequence:
+    tracks: List[TrackMeta]
+    edges: List[CompatibilityEdge]   # edge[i] = transition from tracks[i] to tracks[i+1]
+    total_duration: float
+
+    def describe(self):
+        print(f"\nSequence: {len(self.tracks)} tracks, {self.total_duration/60:.1f} min")
+        print(f"{'─'*65}")
+        for i, t in enumerate(self.tracks):
+            dur = f"{int(t.duration//60)}:{int(t.duration%60):02d}"
+            if i < len(self.edges):
+                e = self.edges[i]
+                arrow = f"→ harm={e.harmonic:.2f} rhythm={e.rhythmic:.2f} score={e.score:.2f}"
+            else:
+                arrow = "(end)"
+            print(f"  {i+1:>2}. [{t.key} {t.bpm:.0f}bpm {dur}] {t.title[:40]}")
+            if arrow != "(end)":
+                print(f"      {arrow}")
+
+
+def build_compatibility_graph(
+    tracks: List[TrackMeta],
+    harm_weight: float = 0.6,
+    rhythm_weight: float = 0.4,
+) -> Dict[str, List[CompatibilityEdge]]:
+    """
+    Build a full directed compatibility graph.
+    Each track -> list of edges to all other tracks, sorted by score descending.
+    """
+    graph: Dict[str, List[CompatibilityEdge]] = {t.file_path: [] for t in tracks}
+
+    for i, a in enumerate(tracks):
+        for j, b in enumerate(tracks):
+            if i == j:
+                continue
+            harm   = camelot_compatibility(a.key, b.key)
+            rhythm = bpm_compatibility(a.bpm, b.bpm)
+            score  = harm_weight * harm + rhythm_weight * rhythm
+
+            graph[a.file_path].append(CompatibilityEdge(
+                track_a=a.file_path,
+                track_b=b.file_path,
+                harmonic=round(harm, 3),
+                rhythmic=round(rhythm, 3),
+                score=round(score, 3),
+            ))
+
+        # Sort edges by score descending
+        graph[a.file_path].sort(key=lambda e: -e.score)
+
+    return graph
+
+
+def sequence_greedy(
+    tracks: List[TrackMeta],
+    start: Optional[TrackMeta] = None,
+    n_tracks: Optional[int] = None,
+    min_score: float = 0.3,
+    cooldown: int = 5,
+    seed: Optional[int] = None,
+) -> Sequence:
+    """
+    Greedy sequencer: always pick the highest-scoring unplayed next track.
+
+    Args:
+        tracks:     Full library of analyzed tracks.
+        start:      Starting track (random if None).
+        n_tracks:   How many tracks in the sequence (all if None).
+        min_score:  Minimum compatibility score to accept a transition.
+                    If no track meets this, picks the best available.
+        cooldown:   Don't revisit a track until this many tracks have played.
+        seed:       Random seed for reproducibility.
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    if not tracks:
+        return Sequence(tracks=[], edges=[], total_duration=0)
+
+    n = n_tracks or len(tracks)
+    graph = build_compatibility_graph(tracks)
+    track_map = {t.file_path: t for t in tracks}
+
+    # Start track
+    current = start or random.choice(tracks)
+    sequence_tracks = [current]
+    sequence_edges  = []
+    recent = [current.file_path]   # cooldown window
+
+    while len(sequence_tracks) < n:
+        candidates = graph[current.file_path]
+
+        # Filter out recently played tracks
+        candidates = [e for e in candidates if e.track_b not in recent[-cooldown:]]
+
+        if not candidates:
+            break  # Exhausted options
+
+        # Pick best candidate (or best above min_score)
+        good = [e for e in candidates if e.score >= min_score]
+        chosen_edge = good[0] if good else candidates[0]
+
+        next_track = track_map[chosen_edge.track_b]
+        sequence_tracks.append(next_track)
+        sequence_edges.append(chosen_edge)
+        recent.append(next_track.file_path)
+        current = next_track
+
+    total_duration = sum(t.duration for t in sequence_tracks)
+    return Sequence(
+        tracks=sequence_tracks,
+        edges=sequence_edges,
+        total_duration=total_duration,
+    )
+
+
+def sequence_energy_arc(
+    tracks: List[TrackMeta],
+    arc: str = "peak",
+    n_tracks: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> Sequence:
+    """
+    Energy-arc sequencer: shapes the set toward a target energy narrative.
+
+    arc options:
+      "peak"      — build → peak → cool down (classic DJ set shape)
+      "steady"    — consistent energy throughout
+      "build"     — continuously building
+      "wave"      — two peaks with a valley between
+
+    Scores candidate tracks by both compatibility AND how well they
+    fit the target energy at each position in the sequence.
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    n = n_tracks or len(tracks)
+    graph = build_compatibility_graph(tracks)
+    track_map = {t.file_path: t for t in tracks}
+
+    # Build target energy curve
+    positions = np.linspace(0, 1, n)
+    if arc == "peak":
+        # Ramp up to 0.7, peak at 0.6 position, cool down
+        target = np.where(
+            positions < 0.6,
+            0.3 + positions / 0.6 * 0.7,
+            1.0 - (positions - 0.6) / 0.4 * 0.6
+        )
+    elif arc == "steady":
+        target = np.full(n, 0.7)
+    elif arc == "build":
+        target = 0.2 + positions * 0.8
+    elif arc == "wave":
+        target = 0.4 + 0.5 * np.sin(positions * 2 * np.pi)
+        target = np.clip(target, 0, 1)
+    else:
+        target = np.full(n, 0.7)
+
+    def track_mean_energy(t: TrackMeta) -> float:
+        if t.energy_curve:
+            return float(np.mean(t.energy_curve))
+        return 0.5
+
+    def energy_score(t: TrackMeta, position: int) -> float:
+        target_e = target[min(position, n - 1)]
+        actual_e = track_mean_energy(t)
+        return max(0, 1.0 - abs(target_e - actual_e) * 2)
+
+    # Start with a track that fits position 0's energy target
+    def start_score(t):
+        return energy_score(t, 0)
+
+    current = max(tracks, key=start_score)
+    sequence_tracks = [current]
+    sequence_edges  = []
+    recent = [current.file_path]
+    cooldown = 5
+
+    while len(sequence_tracks) < n:
+        pos = len(sequence_tracks)
+        candidates = graph[current.file_path]
+        candidates = [e for e in candidates if e.track_b not in recent[-cooldown:]]
+
+        if not candidates:
+            break
+
+        # Combined score: compatibility + energy arc fit
+        def combined_score(e):
+            t = track_map[e.track_b]
+            return 0.5 * e.score + 0.5 * energy_score(t, pos)
+
+        chosen_edge = max(candidates, key=combined_score)
+        next_track = track_map[chosen_edge.track_b]
+
+        sequence_tracks.append(next_track)
+        sequence_edges.append(chosen_edge)
+        recent.append(next_track.file_path)
+        current = next_track
+
+    total_duration = sum(t.duration for t in sequence_tracks)
+    return Sequence(
+        tracks=sequence_tracks,
+        edges=sequence_edges,
+        total_duration=total_duration,
+    )

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Analysis cache / DB
+*.db
+*.db-shm
+*.db-wal
+
+# Rendered audio output
+*.wav
+*.flac
+*.aiff
+*.aif
+*.mp3
+*.m4a
+*.ogg
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
