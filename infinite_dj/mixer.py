@@ -862,12 +862,9 @@ def render_set(
         in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
 
         # ── Build the crossfade regions ────────────────────────────────────────
-        # In splice mode the crossfade must fit inside a short segment, so cap it
-        # to ~1/3 of the segment (min 2 bars); otherwise use the style's length.
+        # Crossfades run their full style length (up to n_mix_bars) even in
+        # splice mode — a short segment that's mostly crossfade is the point.
         n_bars = style.n_bars
-        if splice and not style.is_cut:
-            seg_len = max(0.0, cue_out_sample / sr - read_t)
-            n_bars = max(2, min(n_bars, int((seg_len / 3.0) / out_bar_sec)))
 
         # Guarantee the outgoing track has a full overlap's worth of audio after
         # the exit cue — otherwise a cue near the track end collapses the blend
@@ -947,6 +944,79 @@ def render_set(
     if peak > 0.95:
         output = output * (0.95 / peak)
 
+    return output, sr, markers
+
+
+def render_layered(
+    tracks: list,
+    sr: int = MIX_SR,
+    target_length_sec: float = 600.0,
+    layer_bars: int = 16,
+    layers: int = 3,
+) -> tuple:
+    """
+    Overlap-add collage: an experiment where several tracks play at once.
+
+    Everything is locked to one tempo (the pool's median, octave-folded). Each
+    track contributes a `layer_bars`-bar segment from a good entry, equal-power
+    faded in and out, laid onto a shared bar grid. Segments are spaced by
+    `layer_bars / layers` bars, so up to `layers` of them overlap at any moment
+    — a 3-track crossfade when layers=3. Beats stay aligned because every layer
+    is stretched to the set tempo and entered on a downbeat.
+
+    Returns (audio, sr, [SetMarker, ...]).
+    """
+    if len(tracks) < 2:
+        raise ValueError("Need at least 2 tracks for a layered collage")
+
+    bpms = sorted(t.bpm for t in tracks)
+    set_bpm = bpms[len(bpms) // 2]
+    bar_s   = _time_to_samples((60.0 / set_bpm) * 4, sr)
+    layer_s = layer_bars * bar_s
+    hop_s   = max(1, (layer_bars // max(1, layers))) * bar_s
+    fade_s  = max(1, layer_s - hop_s)   # overlap region gets the fade
+
+    total_s = _time_to_samples(target_length_sec, sr)
+    master  = np.zeros((total_s + layer_s + sr, 2), dtype=np.float32)
+
+    def prep(t):
+        audio, _ = _load_audio(t.file_path, sr)
+        audio = _loudness_match(audio, t.loudness, MASTER_LOUDNESS)
+        # Lock to the set tempo (nearest of direct / half / double time).
+        ratio = min([set_bpm / t.bpm, set_bpm / (t.bpm * 2.0), set_bpm / (t.bpm / 2.0)],
+                    key=lambda r: abs(r - 1.0))
+        if abs(ratio - 1.0) > 0.001:
+            audio = _time_stretch(audio, sr, ratio)
+        downs = [d / ratio for d in t.downbeats]
+        ci = _set_entry_cue(t)
+        et = (ci.timestamp / ratio) if ci else (downs[0] if downs else 0.0)
+        et = _find_nearest_downbeat(et, downs, max_offset=(60.0 / set_bpm) * 4 / 2.0)
+        seg = audio[_time_to_samples(et, sr): _time_to_samples(et, sr) + layer_s]
+        if len(seg) < bar_s:
+            return None, ratio
+        n = len(seg)
+        fi = min(fade_s, n // 2)
+        env = np.ones(n, dtype=np.float32)
+        env[:fi]  = np.sin(np.linspace(0.0, np.pi / 2.0, fi))
+        env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
+        return (seg * env.reshape(-1, 1)).astype(np.float32), ratio
+
+    pos, idx, markers = 0, 0, []
+    while pos < total_s and idx < len(tracks):
+        seg, ratio = prep(tracks[idx])
+        if seg is not None:
+            end = min(pos + len(seg), len(master))
+            master[pos:end] += seg[:end - pos]
+            markers.append(SetMarker(
+                time=pos / sr, label=tracks[idx].title, method="layer",
+                stretch_pct=(ratio - 1.0) * 100.0, style=f"layer@{set_bpm:.0f}bpm"))
+        pos += hop_s
+        idx += 1
+
+    output = master[:min(pos + layer_s, len(master))]
+    peak = np.abs(output).max()
+    if peak > 0.95:
+        output = output * (0.95 / peak)
     return output, sr, markers
 
 

@@ -251,6 +251,7 @@ def sequence_for_mixing(
     seed: Optional[int] = None,
     allow_repeats: bool = False,
     cooldown: int = 4,
+    stochastic: bool = False,
 ) -> Sequence:
     """
     Order tracks for a smooth mixed set: strongly prefer beat-matchable
@@ -331,7 +332,16 @@ def sequence_for_mixing(
                 s += 0.75 * clap_rank(e.cue_similarity)
             return s
 
-        chosen = max(candidates, key=score)
+        if stochastic and len(candidates) > 1:
+            # Collage: wander the library — sample from the top candidates
+            # weighted by score rather than always taking the argmax, so it
+            # doesn't loop the same compatible cluster.
+            ranked = sorted(candidates, key=score, reverse=True)[:5]
+            weights = np.array([score(e) for e in ranked], dtype=float)
+            weights = weights - weights.min() + 0.1
+            chosen = ranked[int(np.random.choice(len(ranked), p=weights / weights.sum()))]
+        else:
+            chosen = max(candidates, key=score)
         nxt = track_map[chosen.track_b]
         seq_tracks.append(nxt)
         seq_edges.append(chosen)

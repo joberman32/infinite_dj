@@ -4,6 +4,21 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-22 — Layered collage + uncapped splice crossfades
+
+- Removed the splice-mode crossfade cap: crossfades run their full style length
+  (up to n_mix_bars) even on short segments — a segment that's mostly crossfade
+  is desirable, not a bug.
+- New `render_layered` (`splice --layers N`): overlap-add collage where up to N
+  tracks sound at once. All layers are stretched to one tempo (pool median,
+  octave-folded) and entered on a shared bar grid spaced `layer_bars/N` bars
+  apart, so beats stay aligned during the N-way overlap. Equal-power fades;
+  peak-normalized (3-way sums verified non-clipping).
+- `sequence_for_mixing(stochastic=True)` + larger cooldown for collage mode:
+  samples from the top-5 candidates weighted by score instead of the argmax, so
+  the collage wanders the whole library (24/25 tracks used, was 12/25) instead
+  of looping the most-compatible cluster.
+
 ## 2026-07-22 — Splice mode (short-segment collage sets)
 
 - New `splice` command / `render_set` mode: build a target-length collage from

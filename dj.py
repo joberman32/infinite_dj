@@ -443,7 +443,7 @@ def cmd_splice(args):
     CLAP-serendipitous cut points, filling a target length.
     """
     import soundfile as sf
-    from infinite_dj.mixer import render_set
+    from infinite_dj.mixer import render_set, render_layered
 
     db = TrackDB(args.db)
     tracks = db.load_all()
@@ -454,35 +454,48 @@ def cmd_splice(args):
         return
 
     target_sec = args.length * 60.0
-    min_seg, max_seg = args.min_seg, args.max_seg
-    if min_seg >= max_seg:
-        print("--min-seg must be less than --max-seg.")
-        return
-
-    # Enough segments (with repeats) to fill the target, plus a small buffer.
-    avg_seg = (min_seg + max_seg) / 2.0
-    n_seg = int(target_sec / avg_seg) + 4
     cooldown = min(4, len(tracks) - 1)
 
-    print(f"Building {args.arc} splice sequence "
-          f"(~{n_seg} segments, {min_seg:.0f}-{max_seg:.0f}s each) for "
-          f"{args.length:.0f} min...")
-    seq = sequence_for_mixing(tracks, arc=args.arc, n_tracks=n_seg,
-                              allow_repeats=True, cooldown=cooldown)
-
-    print(f"\nSplicing {len(seq.tracks)} segments...")
-    audio, sr, markers = render_set(
-        seq.tracks, min_seg_sec=min_seg, max_seg_sec=max_seg,
-        target_length_sec=target_sec)
+    if args.layers > 1:
+        # Overlap-add collage: several tracks sound at once.
+        n_seg = int(target_sec / 6.0) + args.layers + 4  # generous; render stops at target
+        # Wander the whole library: bigger cooldown + stochastic picks so the
+        # collage doesn't loop the same compatible cluster.
+        collage_cd = min(len(tracks) - 1, 10)
+        print(f"Building {args.arc} sequence for a {args.layers}-track overlap "
+              f"collage ({args.length:.0f} min)...")
+        seq = sequence_for_mixing(tracks, arc=args.arc, n_tracks=n_seg,
+                                  allow_repeats=True, cooldown=collage_cd,
+                                  stochastic=True)
+        print(f"\nLayering up to {args.layers} tracks at once...")
+        audio, sr, markers = render_layered(
+            seq.tracks, target_length_sec=target_sec, layers=args.layers)
+    else:
+        min_seg, max_seg = args.min_seg, args.max_seg
+        if min_seg >= max_seg:
+            print("--min-seg must be less than --max-seg.")
+            return
+        avg_seg = (min_seg + max_seg) / 2.0
+        n_seg = int(target_sec / avg_seg) + 4
+        print(f"Building {args.arc} splice sequence "
+              f"(~{n_seg} segments, {min_seg:.0f}-{max_seg:.0f}s each) for "
+              f"{args.length:.0f} min...")
+        seq = sequence_for_mixing(tracks, arc=args.arc, n_tracks=n_seg,
+                                  allow_repeats=True, cooldown=cooldown)
+        print(f"\nSplicing {len(seq.tracks)} segments...")
+        audio, sr, markers = render_set(
+            seq.tracks, min_seg_sec=min_seg, max_seg_sec=max_seg,
+            target_length_sec=target_sec)
 
     sf.write(args.out, audio, sr, subtype='PCM_16')
     duration = len(audio) / sr
     mb = os.path.getsize(args.out) / 1024 / 1024
 
+    kind = f"{args.layers}-track overlap" if args.layers > 1 else "splices"
     print(f"\nSplice set rendered: {args.out}")
     print(f"  {sr} Hz / 16-bit | Duration: {duration/60:.1f} min | "
-          f"{len(markers)} splices | Size: {mb:.1f} MB")
-    print(f"\n  Splices:")
+          f"{len(markers)} {kind} | Size: {mb:.1f} MB")
+    print(f"\n  Entries:")
     prev = 0.0
     for mk in markers:
         m, s = divmod(mk.time, 60)
@@ -611,6 +624,9 @@ def main():
                           help="Minimum segment length in seconds (default 20)")
     p_splice.add_argument("--max-seg", type=float, default=120.0, dest="max_seg",
                           help="Maximum segment length in seconds (default 120)")
+    p_splice.add_argument("--layers", type=int, default=1,
+                          help="Overlap-add collage: max tracks sounding at once "
+                               "(1 = sequential splices; try 3)")
     p_splice.add_argument("--arc", default="steady",
                           choices=["peak", "steady", "build", "wave"])
 
