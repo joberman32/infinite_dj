@@ -101,13 +101,35 @@ class CLAPExtractor:
 
         try:
             import torch
-            inputs = self.processor(
-                audios=segment,
-                sampling_rate=CLAP_TARGET_SR,
-                return_tensors="pt"
-            )
+            # transformers >=5 renamed `audios` -> `audio`; support both.
+            try:
+                inputs = self.processor(
+                    audio=segment,
+                    sampling_rate=CLAP_TARGET_SR,
+                    return_tensors="pt",
+                )
+            except TypeError:
+                inputs = self.processor(
+                    audios=segment,
+                    sampling_rate=CLAP_TARGET_SR,
+                    return_tensors="pt",
+                )
             with torch.no_grad():
                 audio_embeds = self.model.get_audio_features(**inputs)
+                # transformers >=5 may return an output object rather than a
+                # bare (batch, 512) tensor — unwrap the pooled features.
+                if not isinstance(audio_embeds, torch.Tensor):
+                    obj = audio_embeds
+                    audio_embeds = None
+                    for attr in ("audio_embeds", "pooler_output", "last_hidden_state"):
+                        val = getattr(obj, attr, None)
+                        if val is not None:
+                            audio_embeds = val
+                            break
+                    if audio_embeds is None:
+                        raise TypeError("Unrecognized CLAP audio-feature output")
+                if audio_embeds.ndim > 2:  # (b, seq, dim) -> pool over sequence
+                    audio_embeds = audio_embeds.mean(dim=1)
                 # L2 normalize
                 audio_embeds = audio_embeds / audio_embeds.norm(dim=-1, keepdim=True)
                 vector = audio_embeds[0].cpu().numpy().tolist()
