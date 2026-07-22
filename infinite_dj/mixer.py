@@ -692,6 +692,27 @@ def _pick_exit_cue(track: TrackMeta, min_t: float, max_t: float,
     return max(groovy or outs, key=lambda c: c.confidence)
 
 
+def _track_splice_points(track: TrackMeta, min_len_sec: float = 8.0) -> list:
+    """
+    Ordered entry points for splicing a track, one per *distinct structural
+    segment* (intro / build / drop / breakdown / …) from the analyzer's novelty
+    segmentation — so recurring splices are musically different parts, chosen
+    with sensitivity to dynamics, not an arbitrary grid.
+
+    Segments are ordered by energy (strongest first) so a track's first splice
+    is its most recognizable moment and later ones contrast. Falls back to
+    scored cue points, then downbeats, when sections are unavailable.
+    """
+    if track.sections:
+        segs = [s for s in track.sections if (s.end - s.start) >= min_len_sec] \
+            or list(track.sections)
+        return [s.start for s in sorted(segs, key=lambda s: -s.energy)]
+    cues = sorted({c.timestamp for c in track.cue_points})
+    if cues:
+        return cues
+    return [track.downbeats[0]] if track.downbeats else [0.0]
+
+
 def _pick_splice_exit(cur_t: TrackMeta, nxt_t: TrackMeta, min_t: float, max_t: float):
     """
     For splice mode: choose the OUT cue in the [min_t, max_t] window whose CLAP
@@ -988,11 +1009,9 @@ def render_layered(
         if abs(ratio - 1.0) > 0.001:
             audio = _time_stretch(audio, sr, ratio)
         downs = [d / ratio for d in t.downbeats]
-        # Each occurrence of a track enters at a DIFFERENT cue point (spread
-        # across the track), so a repeated track contributes a different splice
-        # rather than the identical segment every time.
-        entries = sorted({c.timestamp for c in t.cue_points}) or \
-            ([t.downbeats[0]] if t.downbeats else [0.0])
+        # Each occurrence enters a DIFFERENT structural segment (dynamics-aware),
+        # so a repeated track is heard as musically distinct splices, not a loop.
+        entries = _track_splice_points(t)
         et = entries[occurrence % len(entries)] / ratio
         et = _find_nearest_downbeat(et, downs, max_offset=(60.0 / set_bpm) * 4 / 2.0)
         seg = audio[_time_to_samples(et, sr): _time_to_samples(et, sr) + layer_s]
