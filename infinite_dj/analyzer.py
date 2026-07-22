@@ -24,10 +24,12 @@ SR          = 22050    # sample rate for analysis (mono, downsampled)
 HOP_LENGTH  = 512      # librosa default hop
 N_MELS      = 128
 
-# Tempo octave-normalization band. beat_track frequently locks to half- or
-# double-time; we fold the detected tempo into a single octave [MIN, 2*MIN)
-# so half/double errors resolve to a consistent representative tempo and the
-# beat grid is re-gridded to match (not just the BPM number relabeled).
+# Beat tracking uses a finer hop for tempo/phase precision (~11.6 ms/frame).
+BEAT_HOP    = 256
+
+# Tempo octave band. We estimate the dominant tempo over a wide range, then fold
+# it into a single octave [MIN, 2*MIN) so half/double detections resolve to a
+# consistent representative tempo.
 BPM_MIN     = 90.0
 BPM_MAX     = 180.0    # == 2 * BPM_MIN (one octave)
 
@@ -38,35 +40,72 @@ def _frames_to_times(frames, sr=SR, hop_length=HOP_LENGTH):
     return librosa.frames_to_time(frames, sr=sr, hop_length=hop_length).tolist()
 
 
-def _octave_normalize(bpm: float, beat_times: list) -> tuple[float, list]:
-    """
-    Fold a detected tempo into the [BPM_MIN, BPM_MAX) octave and re-grid the
-    beats to match. beat_track often locks to half- or double-time; relabeling
-    the BPM alone would leave the beat spacing wrong, so we actually insert
-    midpoint beats (when doubling) or drop every other beat (when halving).
-    """
-    beats = list(beat_times)
+def _adaptive_mean(x: np.ndarray, n: int) -> np.ndarray:
+    return np.convolve(x, np.ones(int(n)) / float(n), mode="same")
 
+
+def _fold_octave(bpm: float) -> float:
+    """Fold a tempo into [BPM_MIN, BPM_MAX) by doubling/halving."""
     guard = 0
-    while bpm < BPM_MIN and guard < 4:
-        # Double: insert a beat halfway between each adjacent pair
-        doubled = []
-        for i in range(len(beats) - 1):
-            doubled.append(beats[i])
-            doubled.append((beats[i] + beats[i + 1]) / 2.0)
-        if beats:
-            doubled.append(beats[-1])
-        beats = doubled
-        bpm *= 2.0
-        guard += 1
-
+    while bpm < BPM_MIN and guard < 8:
+        bpm *= 2.0; guard += 1
     while bpm >= BPM_MAX and guard < 8:
-        # Halve: keep every other beat
-        beats = beats[::2]
-        bpm /= 2.0
-        guard += 1
+        bpm /= 2.0; guard += 1
+    return bpm
 
-    return bpm, beats
+
+def _refine_tempo_phase(onset_env: np.ndarray, sr: int, hop: int,
+                        tempo_hint: float) -> tuple:
+    """
+    DJ-grade tempo + phase: build a rigid, perfectly equidistant beat grid
+    (constant tempo assumed, as real electronic tracks are) instead of the
+    beat-to-beat wobble a dynamic beat tracker produces — that wobble is what
+    makes two tracks drift in and out of phase over a long crossfade.
+
+    We trust librosa's perceptually-anchored tempo for the *metrical level*
+    (which octave/subdivision), then refine it to a precise constant value and
+    find the global beat phase by autocorrelation — the precision that makes a
+    rigid grid actually line up. (Method reimplemented from Vande Veire & De
+    Bie's auto-DJ, not copied.)
+
+    Returns (bpm, phase_seconds, confidence).
+    """
+    oenv = np.clip(onset_env - _adaptive_mean(onset_env, 16), 0.0, None)
+    if oenv.sum() <= 0 or len(oenv) < 8:
+        return _fold_octave(tempo_hint or 120.0), 0.0, 0.0
+
+    ac = np.correlate(oenv, oenv, mode="full")[len(oenv) - 1:]
+    n = len(ac)
+
+    # Refine the tempo on a fine grid within a narrow window of the hint (so the
+    # octave stays librosa's choice, only the precise value is sharpened).
+    center = _fold_octave(tempo_hint or 120.0)
+    bpms = np.arange(center * 0.94, center * 1.06, 0.02)
+    scores = np.zeros(len(bpms))
+    for i, bpm in enumerate(bpms):
+        lag = 60.0 * sr / (bpm * hop)
+        if lag < 1:
+            continue
+        idx = np.round(np.arange(lag, n, lag)).astype(int)
+        idx = idx[idx < n]
+        if len(idx):
+            scores[i] = ac[idx].mean()
+    best = int(np.argmax(scores))
+    tempo = _fold_octave(float(bpms[best]))
+    conf = float(np.clip(scores[best] / (scores.mean() + 1e-9) - 1.0, 0.0, 1.0))
+
+    # Global beat phase: the offset whose beat positions carry the most onset.
+    period = 60.0 * sr / (tempo * hop)       # frames per beat
+    best_phase, best_pscore = 0.0, -1.0
+    for ph in np.arange(0.0, period, 0.5):
+        idx = np.round(np.arange(ph, len(oenv), period)).astype(int)
+        idx = idx[idx < len(oenv)]
+        s = float(oenv[idx].sum()) if len(idx) else 0.0
+        if s > best_pscore:
+            best_pscore, best_phase = s, ph
+    phase_sec = best_phase * hop / sr
+
+    return tempo, phase_sec, conf
 
 
 def _anchor_downbeats(beat_times: list, onset_env: np.ndarray, sr: int, hop: int) -> list:
@@ -95,30 +134,23 @@ def _compute_beats(y, sr):
     """
     Returns (bpm, bpm_confidence, beat_times, downbeat_times).
 
-    Tempo is octave-normalized into the house/techno band with the beat grid
-    re-gridded to match, then downbeats are anchored to the onset-strongest
-    bar phase.
+    Beats are a rigid equidistant grid from a fine tempo + explicit phase
+    estimate (drift-free for beatmatching), with downbeats anchored to the
+    onset-strongest bar phase.
     """
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP_LENGTH)
-    bpm = float(tempo[0]) if hasattr(tempo, '__len__') else float(tempo)
-    beat_times = _frames_to_times(beat_frames)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=BEAT_HOP)
+    # librosa's perceptual tempo prior picks a sensible metrical level; we then
+    # refine it to a precise constant tempo + explicit phase for a rigid grid.
+    tempo_hint = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
+    tempo_hint = float(np.atleast_1d(tempo_hint)[0])
+    tempo, phase_sec, conf = _refine_tempo_phase(onset_env, sr, BEAT_HOP, tempo_hint)
 
-    # Fold half/double-time detections into one octave, re-gridding beats
-    bpm, beat_times = _octave_normalize(bpm, beat_times)
+    duration = len(y) / sr
+    beat_sec = 60.0 / tempo
+    beat_times = list(np.arange(phase_sec, max(phase_sec, duration - beat_sec), beat_sec))
 
-    # Estimate confidence from beat consistency
-    if len(beat_times) > 4:
-        intervals = np.diff(beat_times)
-        cv = np.std(intervals) / (np.mean(intervals) + 1e-8)
-        bpm_confidence = float(np.clip(1.0 - cv * 2, 0, 1))
-    else:
-        bpm_confidence = 0.0
-
-    # Anchor downbeats to the strongest bar phase
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
-    downbeats = _anchor_downbeats(beat_times, onset_env, sr, HOP_LENGTH)
-
-    return bpm, bpm_confidence, beat_times, list(downbeats)
+    downbeats = _anchor_downbeats(beat_times, onset_env, sr, BEAT_HOP)
+    return tempo, conf, beat_times, list(downbeats)
 
 
 def _compute_phrases(downbeats: list, phrase_bars: int = 8) -> list:

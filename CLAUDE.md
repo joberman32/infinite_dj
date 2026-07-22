@@ -59,8 +59,9 @@ infinite_dj/
 ### Analysis pipeline (`analyzer.py`)
 - ~10-30s per track; results cached in SQLite by file hash
 - Extracts: BPM, Camelot key (Krumhansl-Schmuckler on chroma), beat/downbeat/phrase grid, 1s-resolution energy curve, structural sections, scored IN/OUT cue points at every downbeat, integrated loudness (RMS dBFS)
-- **BPM octave normalization**: `beat_track` often locks to half/double time; detected tempo is folded into the `[BPM_MIN, BPM_MAX)` octave (90–180) and the beat grid is re-gridded to match (midpoints inserted when doubling, decimated when halving) — not just the BPM number relabeled
-- **Downbeat anchoring**: bar-1 is the beat phase (of every 4) carrying the most onset energy, via `librosa.onset.onset_strength` — not a naive `beats[::4]`
+- **Rigid equidistant beat grid** (`_refine_tempo_phase`): librosa's `beat_track` supplies the metrical level (octave), then the tempo is refined to a precise constant value and the global beat phase is found by autocorrelation of the onset envelope (finer `BEAT_HOP=256`). Beats are laid down as a perfectly equidistant grid (`arange(phase, dur, 60/bpm)`) rather than following the audio — so two beatmatched tracks stay phase-locked over a long crossfade instead of drifting (the "beatmatch sounds off" cause). Reimplemented from Vande Veire & De Bie's DnB auto-DJ (ideas, not code — that repo is AGPL).
+- **Octave fold**: the refined tempo is folded into `[BPM_MIN, BPM_MAX)` (90–180).
+- **Downbeat anchoring**: bar-1 is the beat phase (of every 4) carrying the most onset energy — not a naive `beats[::4]`
 
 ### Cue point scoring (`cue_detector.py`)
 - Scans the full track (not just start/end windows) — any phrase boundary can be an entry or exit
