@@ -324,6 +324,15 @@ def analyze_track(file_path: str, verbose: bool = True) -> TrackMeta:
 
     log(f"  Sections...", end=" ", flush=True)
     sections = _compute_sections(y, sr, energy_curve, duration)
+    # CLAP embedding of the timbre at each section start, so splice selection can
+    # choose structurally AND texturally distinct segments (optional — skipped
+    # when CLAP isn't installed).
+    try:
+        from .embeddings import get_cue_embedding
+        for s in sections:
+            s.embedding = get_cue_embedding(y, sr, s.start, "in")
+    except Exception:
+        pass
     log(f"{len(sections)} sections: {[s.label for s in sections]}")
 
     loudness = _compute_loudness(y)

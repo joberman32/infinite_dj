@@ -706,6 +706,23 @@ def _track_splice_points(track: TrackMeta, min_len_sec: float = 8.0) -> list:
     if track.sections:
         segs = [s for s in track.sections if (s.end - s.start) >= min_len_sec] \
             or list(track.sections)
+        # If sections carry CLAP embeddings, order them for maximal timbral
+        # distinctness (farthest-first): start from the strongest segment, then
+        # repeatedly add the one least similar to everything chosen so far — so
+        # a recurring track's splices sound as different as possible.
+        if len(segs) > 1 and all(s.embedding for s in segs):
+            def cos(a, b):
+                a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+                return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9))
+            remaining = list(segs)
+            ordered = [max(remaining, key=lambda s: s.energy)]
+            remaining.remove(ordered[0])
+            while remaining:
+                nxt = min(remaining,
+                          key=lambda s: max(cos(s.embedding, o.embedding) for o in ordered))
+                ordered.append(nxt)
+                remaining.remove(nxt)
+            return [s.start for s in ordered]
         return [s.start for s in sorted(segs, key=lambda s: -s.energy)]
     cues = sorted({c.timestamp for c in track.cue_points})
     if cues:

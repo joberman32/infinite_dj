@@ -34,6 +34,7 @@ class Section:
     label: str        # dynamics-based, genre-neutral: intro / rising / peak /
                       # steady / falling / sparse / outro
     energy: float     # mean normalized RMS energy in this section
+    embedding: Optional[List[float]] = None  # CLAP timbre vector at section start
 
     def to_dict(self):
         return self.__dict__
