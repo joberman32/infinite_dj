@@ -16,6 +16,7 @@ Usage:
 import sys
 import os
 import argparse
+import fnmatch
 import json
 
 # Allow running from project root
@@ -32,6 +33,18 @@ from infinite_dj.sequencer import sequence_energy_arc, sequence_greedy
 
 SUPPORTED_FORMATS = (".mp3", ".flac", ".wav", ".aiff", ".aif", ".ogg", ".m4a")
 
+# `analyze` walks a directory and scoops up any audio — including sets/transitions
+# this tool renders into that same folder. These globs skip our own output so it
+# doesn't pollute the library. Add more with `analyze --exclude <glob>`, or keep
+# renders anyway with `analyze --include-renders`.
+RENDER_IGNORE_GLOBS = (
+    "infinite_dj_set*.wav",   # full-set renders
+    "*_full_set*.wav",
+    "*_test_transition*.wav",
+    "*.djset.wav",            # explicit render marker
+    "_*.wav",                 # scratch renders prefixed with underscore
+)
+
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -44,15 +57,29 @@ def cmd_analyze(args):
         print(f"Error: {music_dir} is not a directory.")
         sys.exit(1)
 
+    # Build the ignore list (skip our own renders unless told otherwise)
+    ignore_globs = list(getattr(args, 'exclude', None) or [])
+    if not getattr(args, 'include_renders', False):
+        ignore_globs += list(RENDER_IGNORE_GLOBS)
+
+    def _is_ignored(fname):
+        return any(fnmatch.fnmatch(fname.lower(), g.lower()) for g in ignore_globs)
+
     # Collect audio files
     files = []
+    ignored = 0
     for root, _, fnames in os.walk(music_dir):
         for fname in fnames:
-            if fname.lower().endswith(SUPPORTED_FORMATS):
-                files.append(os.path.join(root, fname))
+            if not fname.lower().endswith(SUPPORTED_FORMATS):
+                continue
+            if _is_ignored(fname):
+                ignored += 1
+                continue
+            files.append(os.path.join(root, fname))
 
     files.sort()
-    print(f"Found {len(files)} audio files in {music_dir}\n")
+    ignored_note = f" ({ignored} excluded)" if ignored else ""
+    print(f"Found {len(files)} audio files in {music_dir}{ignored_note}\n")
 
     analyzed = 0
     skipped  = 0
@@ -409,6 +436,10 @@ def main():
     p_analyze.add_argument("music_dir")
     p_analyze.add_argument("--force", action="store_true",
                            help="Re-analyze even if cached")
+    p_analyze.add_argument("--exclude", action="append", metavar="GLOB",
+                           help="Skip files matching this glob (repeatable)")
+    p_analyze.add_argument("--include-renders", action="store_true",
+                           help="Also analyze this tool's own rendered sets/transitions")
 
     # library
     sub.add_parser("library", help="List all analyzed tracks")
