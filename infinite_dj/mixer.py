@@ -32,6 +32,7 @@ except ImportError:
     HAS_RUBBERBAND = False
 
 from .models import TrackMeta, CuePoint
+from .harmony import camelot_compatibility
 
 # Full quality SR for output
 MIX_SR = 44100
@@ -692,34 +693,39 @@ def _pick_exit_cue(track: TrackMeta, min_t: float, max_t: float,
     return max(groovy or outs, key=lambda c: c.confidence)
 
 
+def _clap_cos(a, b) -> float:
+    """Cosine similarity of two CLAP embedding vectors."""
+    a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+    return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9))
+
+
+def _track_sections(track: TrackMeta, min_len_sec: float = 8.0) -> list:
+    """The track's structural sections long enough to splice (all, if none pass)."""
+    if not track.sections:
+        return []
+    return [s for s in track.sections if (s.end - s.start) >= min_len_sec] \
+        or list(track.sections)
+
+
 def _track_splice_points(track: TrackMeta, min_len_sec: float = 8.0) -> list:
     """
     Ordered entry points for splicing a track, one per *distinct structural
-    segment* (intro / build / drop / breakdown / …) from the analyzer's novelty
-    segmentation — so recurring splices are musically different parts, chosen
-    with sensitivity to dynamics, not an arbitrary grid.
+    segment* from the analyzer's novelty segmentation — so recurring splices are
+    musically different parts, chosen with sensitivity to dynamics.
 
-    Segments are ordered by energy (strongest first) so a track's first splice
-    is its most recognizable moment and later ones contrast. Falls back to
-    scored cue points, then downbeats, when sections are unavailable.
+    When sections carry CLAP embeddings they are ordered for maximal timbral
+    distinctness (farthest-first from the strongest); otherwise by energy. Falls
+    back to scored cue points, then downbeats.
     """
-    if track.sections:
-        segs = [s for s in track.sections if (s.end - s.start) >= min_len_sec] \
-            or list(track.sections)
-        # If sections carry CLAP embeddings, order them for maximal timbral
-        # distinctness (farthest-first): start from the strongest segment, then
-        # repeatedly add the one least similar to everything chosen so far — so
-        # a recurring track's splices sound as different as possible.
+    segs = _track_sections(track, min_len_sec)
+    if segs:
         if len(segs) > 1 and all(s.embedding for s in segs):
-            def cos(a, b):
-                a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
-                return float(a @ b / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9))
             remaining = list(segs)
             ordered = [max(remaining, key=lambda s: s.energy)]
             remaining.remove(ordered[0])
             while remaining:
                 nxt = min(remaining,
-                          key=lambda s: max(cos(s.embedding, o.embedding) for o in ordered))
+                          key=lambda s: max(_clap_cos(s.embedding, o.embedding) for o in ordered))
                 ordered.append(nxt)
                 remaining.remove(nxt)
             return [s.start for s in ordered]
@@ -985,78 +991,163 @@ def render_set(
     return output, sr, markers
 
 
-def render_layered(
+def render_collage(
     tracks: list,
     sr: int = MIX_SR,
-    target_length_sec: float = 600.0,
-    layer_bars: int = 16,
+    target_length_sec: float = 300.0,
     layers: int = 3,
+    min_seg_bars: int = 8,
+    max_seg_bars: int = 24,
+    seed: Optional[int] = None,
 ) -> tuple:
     """
-    Overlap-add collage: an experiment where several tracks play at once.
+    Structured, variable-pace overlap-add collage.
 
-    Everything is locked to one tempo (the pool's median, octave-folded). Each
-    track contributes a `layer_bars`-bar segment from a good entry, equal-power
-    faded in and out, laid onto a shared bar grid. Segments are spaced by
-    `layer_bars / layers` bars, so up to `layers` of them overlap at any moment
-    — a 3-track crossfade when layers=3. Beats stay aligned because every layer
-    is stretched to the set tempo and entered on a downbeat.
+    Everything is locked to one tempo (pool median, octave-folded) and entered on
+    a shared downbeat grid, so overlapping segments stay beat-aligned. Rather than
+    a fixed cadence, the collage is composed into *movements* whose editing pace
+    ebbs and flows:
+
+      - feature: one track holds, playing several of its own sections contiguously
+        in natural time order (reads as the track condensed).
+      - weave:   rapid, heavily-overlapping segments chosen to be TIMBRALLY
+        CONTRASTING (CLAP-farthest) from what's already sounding — contrasting
+        sections auto-mixed to each other, within or across tracks.
+      - breathe: a long segment plays mostly alone before the next.
 
     Returns (audio, sr, [SetMarker, ...]).
     """
+    import random
+    rng = random.Random(seed)
     if len(tracks) < 2:
-        raise ValueError("Need at least 2 tracks for a layered collage")
+        raise ValueError("Need at least 2 tracks for a collage")
 
-    bpms = sorted(t.bpm for t in tracks)
+    bpms    = sorted(t.bpm for t in tracks)
     set_bpm = bpms[len(bpms) // 2]
-    bar_s   = _time_to_samples((60.0 / set_bpm) * 4, sr)
-    layer_s = layer_bars * bar_s
-    hop_s   = max(1, (layer_bars // max(1, layers))) * bar_s
-    fade_s  = max(1, layer_s - hop_s)   # overlap region gets the fade
-
+    bar     = (60.0 / set_bpm) * 4
+    bar_s   = _time_to_samples(bar, sr)
     total_s = _time_to_samples(target_length_sec, sr)
-    master  = np.zeros((total_s + layer_s + sr, 2), dtype=np.float32)
+    master  = np.zeros((total_s + max_seg_bars * bar_s + sr, 2), dtype=np.float32)
 
-    def prep(t, occurrence):
-        audio, _ = _load_audio(t.file_path, sr)
-        audio = _loudness_match(audio, t.loudness, MASTER_LOUDNESS)
-        # Lock to the set tempo (nearest of direct / half / double time).
-        ratio = min([set_bpm / t.bpm, set_bpm / (t.bpm * 2.0), set_bpm / (t.bpm / 2.0)],
-                    key=lambda r: abs(r - 1.0))
-        if abs(ratio - 1.0) > 0.001:
-            audio = _time_stretch(audio, sr, ratio)
-        downs = [d / ratio for d in t.downbeats]
-        # Each occurrence enters a DIFFERENT structural segment (dynamics-aware),
-        # so a repeated track is heard as musically distinct splices, not a loop.
-        entries = _track_splice_points(t)
-        et = entries[occurrence % len(entries)] / ratio
-        et = _find_nearest_downbeat(et, downs, max_offset=(60.0 / set_bpm) * 4 / 2.0)
-        seg = audio[_time_to_samples(et, sr): _time_to_samples(et, sr) + layer_s]
+    # Stretch each track to the set tempo once, then reuse (fast repeated splices).
+    cache = {}
+    def get_track(t):
+        if t.file_path not in cache:
+            audio, _ = _load_audio(t.file_path, sr)
+            audio = _loudness_match(audio, t.loudness, MASTER_LOUDNESS)
+            ratio = min([set_bpm / t.bpm, set_bpm / (t.bpm * 2.0), set_bpm / (t.bpm / 2.0)],
+                        key=lambda r: abs(r - 1.0))
+            if abs(ratio - 1.0) > 0.001:
+                audio = _time_stretch(audio, sr, ratio)
+            cache[t.file_path] = (audio, [d / ratio for d in t.downbeats], ratio)
+        return cache[t.file_path]
+
+    def emit(t, section, seg_bars, fade_bars):
+        """Extract a beat-aligned, equal-power-faded segment; None if too short."""
+        audio, downs, ratio = get_track(t)
+        entry = _find_nearest_downbeat(section.start / ratio, downs, max_offset=bar / 2.0)
+        es = _time_to_samples(entry, sr)
+        seg = audio[es: es + int(seg_bars) * bar_s]
         if len(seg) < bar_s:
-            return None, ratio
+            return None
         n = len(seg)
-        fi = min(fade_s, n // 2)
+        fi = int(np.clip(int(fade_bars) * bar_s, 1, n // 2))
         env = np.ones(n, dtype=np.float32)
         env[:fi]  = np.sin(np.linspace(0.0, np.pi / 2.0, fi))
         env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
-        return (seg * env.reshape(-1, 1)).astype(np.float32), ratio
+        return (seg * env.reshape(-1, 1)).astype(np.float32)
 
-    pos, idx, markers, seen = 0, 0, [], {}
-    while pos < total_s and idx < len(tracks):
-        t = tracks[idx]
-        k = seen.get(t.file_path, 0)
-        seen[t.file_path] = k + 1
-        seg, ratio = prep(t, k)
+    seg_pool = [(t, s) for t in tracks for s in _track_sections(t)]
+    have_emb = any(s.embedding for _, s in seg_pool)
+
+    markers, pos, active, recent = [], 0, [], []
+
+    def prune():
+        active[:] = [a for a in active if a[1] > pos]
+
+    def place(t, section, seg_bars, fade_bars, mode, hop_bars):
+        """Overlap-add one segment at `pos`, log it, advance `pos` by hop_bars."""
+        nonlocal pos
+        seg = emit(t, section, seg_bars, fade_bars)
         if seg is not None:
             end = min(pos + len(seg), len(master))
             master[pos:end] += seg[:end - pos]
             markers.append(SetMarker(
-                time=pos / sr, label=f"{t.title}  [splice {k+1}]", method="layer",
-                stretch_pct=(ratio - 1.0) * 100.0, style=f"layer@{set_bpm:.0f}bpm"))
-        pos += hop_s
-        idx += 1
+                time=pos / sr,
+                label=f"{t.title.split(' - ')[-1][:30]}  [{section.label} @{section.start:.0f}s]",
+                method=mode, stretch_pct=0.0, style=mode))
+            active.append((section.embedding, pos + len(seg)))
+            recent.append(t.file_path)
+        pos += max(bar_s, int(hop_bars) * bar_s)
 
-    output = master[:min(pos + layer_s, len(master))]
+    def pick_contrast(last_key):
+        """A (track, section) most timbrally contrasting to what's sounding now."""
+        prune()
+        act = [e for (e, _) in active if e is not None]
+        cands = [ts for ts in seg_pool if ts[0].file_path not in recent[-2:]] or seg_pool
+        if have_emb and act:
+            ranked = sorted(
+                cands,
+                key=lambda ts: max(_clap_cos(ts[1].embedding, e) for e in act)
+                if ts[1].embedding else 1.0)
+            top = ranked[:6]
+            if last_key:  # among the most-contrasting, favour harmonic fit
+                top.sort(key=lambda ts: -camelot_compatibility(last_key, ts[0].key))
+            return top[0]
+        return rng.choice(cands)
+
+    guard = 0
+    while pos < total_s and guard < 100000:
+        guard += 1
+        prune()
+        progress = pos / total_s
+        w_weave   = 1.5 + (1.5 if 0.2 <= progress <= 0.85 else 0.0)
+        w_feature = 1.2
+        w_breathe = 1.0 + (1.5 if (progress < 0.2 or progress > 0.85) else 0.0)
+        mode = rng.choices(["weave", "feature", "breathe"],
+                           weights=[w_weave, w_feature, w_breathe])[0]
+
+        if mode == "feature":
+            t = rng.choice([x for x in tracks if x.file_path not in recent[-1:]] or tracks)
+            secs = sorted(_track_sections(t), key=lambda s: s.start)
+            if not secs:
+                pos += bar_s
+                continue
+            K = min(len(secs), rng.randint(2, 4))
+            start_i = rng.randint(0, max(0, len(secs) - K))
+            for s in secs[start_i:start_i + K]:
+                seg_bars = int(np.clip((s.end - s.start) / bar, min_seg_bars, max_seg_bars))
+                # Contiguous: hop ≈ segment length minus a short 2-bar join.
+                place(t, s, seg_bars, fade_bars=2, mode="feature",
+                      hop_bars=max(1, seg_bars - 2))
+
+        elif mode == "weave":
+            last_key = None
+            for _ in range(rng.randint(3, 6)):
+                t, s = pick_contrast(last_key)
+                last_key = t.key
+                seg_bars = rng.randint(min_seg_bars, (min_seg_bars + max_seg_bars) // 2)
+                # Heavy overlap: hop is a fraction of the segment (up to `layers`).
+                place(t, s, seg_bars, fade_bars=max(2, seg_bars // 2), mode="weave",
+                      hop_bars=max(1, seg_bars // max(1, layers)))
+                if pos >= total_s:
+                    break
+
+        else:  # breathe
+            for _ in range(rng.randint(1, 2)):
+                t, s = pick_contrast(None)
+                seg_bars = rng.randint((min_seg_bars + max_seg_bars) // 2, max_seg_bars)
+                place(t, s, seg_bars, fade_bars=max(2, seg_bars // 4), mode="breathe",
+                      hop_bars=max(1, seg_bars - 1))  # minimal overlap
+                if pos >= total_s:
+                    break
+
+    # Trim trailing silence and fade the very end.
+    nz = np.nonzero(np.abs(master).sum(axis=1))[0]
+    output = master[:nz[-1] + 1] if len(nz) else master[:total_s]
+    fade_s = min(int(2.0 * sr), len(output))
+    if fade_s > 0:
+        output[-fade_s:] *= np.linspace(1.0, 0.0, fade_s, dtype=np.float32).reshape(-1, 1)
     peak = np.abs(output).max()
     if peak > 0.95:
         output = output * (0.95 / peak)

@@ -4,6 +4,24 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-22 — Structured variable-pace collage (render_collage)
+
+- Replaced the fixed-cadence `render_layered` (a new track every ~9 s) with
+  `render_collage`, a structured scheduler whose editing pace ebbs and flows.
+  It composes *movements*: **feature** (one track holds, playing several of its
+  own sections contiguously in natural time order), **weave** (rapid, heavily
+  overlapping segments chosen to be timbrally CONTRASTING — CLAP-farthest — from
+  what's already sounding, within or across tracks), and **breathe** (a long
+  segment mostly alone). Movement weights loosely arc over the set.
+- Segment lengths vary (`--min-seg-bars`/`--max-seg-bars`); `--seed` makes pacing
+  reproducible; `--layers` is the weave overlap ceiling. Tracks are stretched to
+  the set tempo once and cached (many faster repeated splices).
+- Reuses the beat-locked overlap-add core, `Section.embedding`, the farthest-
+  first primitive, and `camelot_compatibility` (harmonic tie-break among the
+  most-contrasting weave candidates). Markers tag the movement (feature/weave/
+  breathe). Verified: inter-entry gap std 0→15 s, feature holds are same-track
+  time-ordered, no silence gaps, peak ≤ 0.95.
+
 ## 2026-07-22 — Layered collage + uncapped splice crossfades
 
 - Removed the splice-mode crossfade cap: crossfades run their full style length

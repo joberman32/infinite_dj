@@ -443,7 +443,7 @@ def cmd_splice(args):
     CLAP-serendipitous cut points, filling a target length.
     """
     import soundfile as sf
-    from infinite_dj.mixer import render_set, render_layered
+    from infinite_dj.mixer import render_set, render_collage
 
     db = TrackDB(args.db)
     tracks = db.load_all()
@@ -457,19 +457,13 @@ def cmd_splice(args):
     cooldown = min(4, len(tracks) - 1)
 
     if args.layers > 1:
-        # Overlap-add collage: several tracks sound at once.
-        n_seg = int(target_sec / 6.0) + args.layers + 4  # generous; render stops at target
-        # Wander the whole library: bigger cooldown + stochastic picks so the
-        # collage doesn't loop the same compatible cluster.
-        collage_cd = min(len(tracks) - 1, 10)
-        print(f"Building {args.arc} sequence for a {args.layers}-track overlap "
-              f"collage ({args.length:.0f} min)...")
-        seq = sequence_for_mixing(tracks, arc=args.arc, n_tracks=n_seg,
-                                  allow_repeats=True, cooldown=collage_cd,
-                                  stochastic=True)
-        print(f"\nLayering up to {args.layers} tracks at once...")
-        audio, sr, markers = render_layered(
-            seq.tracks, target_length_sec=target_sec, layers=args.layers)
+        # Structured, variable-pace overlap-add collage (feature / weave / breathe).
+        print(f"Composing a {args.layers}-layer collage ({args.length:.0f} min, "
+              f"{args.min_seg_bars}-{args.max_seg_bars} bar segments)...")
+        audio, sr, markers = render_collage(
+            tracks, target_length_sec=target_sec, layers=args.layers,
+            min_seg_bars=args.min_seg_bars, max_seg_bars=args.max_seg_bars,
+            seed=args.seed)
     else:
         min_seg, max_seg = args.min_seg, args.max_seg
         if min_seg >= max_seg:
@@ -491,18 +485,19 @@ def cmd_splice(args):
     duration = len(audio) / sr
     mb = os.path.getsize(args.out) / 1024 / 1024
 
-    kind = f"{args.layers}-track overlap" if args.layers > 1 else "splices"
+    kind = "collage entries" if args.layers > 1 else "splices"
     print(f"\nSplice set rendered: {args.out}")
     print(f"  {sr} Hz / 16-bit | Duration: {duration/60:.1f} min | "
           f"{len(markers)} {kind} | Size: {mb:.1f} MB")
-    print(f"\n  Entries:")
+    print(f"\n  Entries (gap since previous shows the varying pace):")
     prev = 0.0
     for mk in markers:
         m, s = divmod(mk.time, 60)
-        seg = mk.time - prev
+        gap = mk.time - prev
         prev = mk.time
-        out_name = mk.label.split(" → ")[0].split(" - ")[-1][:34]
-        print(f"    {int(m)}:{s:04.1f}  (+{seg:4.0f}s)  [{mk.style}]  → {out_name}")
+        mode = (mk.method if args.layers > 1 else mk.style)
+        name = mk.label.split(" → ")[0].split(" - ")[-1][:40]
+        print(f"    {int(m)}:{s:04.1f}  (+{gap:4.0f}s)  [{mode:8}]  {name}")
 
 
 def cmd_play(args):
@@ -627,6 +622,12 @@ def main():
     p_splice.add_argument("--layers", type=int, default=1,
                           help="Overlap-add collage: max tracks sounding at once "
                                "(1 = sequential splices; try 3)")
+    p_splice.add_argument("--min-seg-bars", type=int, default=8, dest="min_seg_bars",
+                          help="Collage: shortest segment in bars (default 8)")
+    p_splice.add_argument("--max-seg-bars", type=int, default=24, dest="max_seg_bars",
+                          help="Collage: longest segment in bars (default 24)")
+    p_splice.add_argument("--seed", type=int, default=None,
+                          help="Collage: random seed for reproducible pacing")
     p_splice.add_argument("--arc", default="steady",
                           choices=["peak", "steady", "build", "wave"])
 
