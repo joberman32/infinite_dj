@@ -493,6 +493,21 @@ def _best_out_cue_after(track: TrackMeta, min_t: float, max_t: float):
     return max(outs, key=lambda c: c.confidence) if outs else None
 
 
+def _set_entry_cue(track: TrackMeta, max_frac: float = 0.4):
+    """
+    Where a track should ENTER in a linear set: the strongest IN cue in its
+    early portion, so it plays a full solo before it has to mix out again. (The
+    cue detector scores IN points across the whole track for arbitrary re-entry;
+    for a set we want an intro/early phrase, not a great entry near the end.)
+    """
+    limit = max(1.0, (track.duration or 0.0) * max_frac)
+    early = [c for c in track.cue_points if c.type == "in" and c.timestamp <= limit]
+    if early:
+        return max(early, key=lambda c: c.confidence)
+    ins = [c for c in track.cue_points if c.type == "in"]
+    return min(ins, key=lambda c: c.timestamp) if ins else None
+
+
 def render_set(
     tracks: list,
     n_mix_bars: int = 16,
@@ -526,7 +541,7 @@ def render_set(
     # Current track state, all in that track's own native timeline.
     cur_t     = tracks[0]
     cur_audio = load_matched(cur_t)
-    ci   = best_cue_in(cur_t)
+    ci   = _set_entry_cue(cur_t)   # start near the top, not at a late re-entry cue
     read = _time_to_samples(
         (ci.timestamp if ci else (cur_t.downbeats[0] if cur_t.downbeats else 0.0)), sr
     )
@@ -550,8 +565,8 @@ def render_set(
         ratio = min(ratios, key=lambda r: abs(r - 1.0))
         beatmatched = abs(ratio - 1.0) <= max_stretch
 
-        # ── Incoming entry: strongest IN cue, snapped to a downbeat ────────────
-        in_cue  = best_cue_in(nxt_t)
+        # ── Incoming entry: an early IN cue so the track plays a full solo ─────
+        in_cue  = _set_entry_cue(nxt_t)
         in_time = in_cue.timestamp if in_cue else (nxt_t.downbeats[0] if nxt_t.downbeats else 0.0)
         in_time = _find_nearest_downbeat(
             in_time, nxt_t.downbeats, max_offset=(60.0 / nxt_t.bpm) * 4 / 2.0
@@ -576,14 +591,19 @@ def render_set(
         in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
 
         # ── Build the crossfade regions ────────────────────────────────────────
+        # Guarantee the outgoing track has a full overlap's worth of audio after
+        # the exit cue — otherwise a cue near the track end collapses the blend
+        # into a 1-2s stub (a "quick fade" instead of a real crossfade).
+        mix_out_s = (_time_to_samples(style.cut_seconds, sr) if style.is_cut
+                     else style.n_bars * out_bar_s)
+        cue_out_sample = min(cue_out_sample, max(read, len(cur_audio) - mix_out_s))
+
         if style.is_cut:
             # Short time-based fade — no long overlap of unsynced tempos.
-            mix_out_s = _time_to_samples(style.cut_seconds, sr)
             out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
             in_mix  = nxt_audio[in_sample:in_sample + mix_out_s]
             ratio   = 1.0
         else:
-            mix_out_s = style.n_bars * out_bar_s
             out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
             in_region = nxt_audio[in_sample:in_sample + style.n_bars * in_bar_s]
             if beatmatched and abs(ratio - 1.0) > 0.001:
