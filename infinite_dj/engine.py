@@ -50,8 +50,8 @@ from .models import TrackMeta, CuePoint
 from .mixer import (
     _load_audio, _time_stretch, _apply_lowpass, _apply_highpass,
     _equal_power_fade, _apply_gain, _find_nearest_downbeat,
-    _blend, _loudness_match, TransitionPlan, MAX_STRETCH, MASTER_LOUDNESS,
-    MIX_SR as SR
+    _blend, _loudness_match, choose_transition_style,
+    TransitionPlan, MAX_STRETCH, MASTER_LOUDNESS, MIX_SR as SR
 )
 from .sequencer import build_compatibility_graph, sequence_energy_arc
 from .harmony import camelot_compatibility, bpm_compatibility
@@ -77,6 +77,7 @@ class TransitionEvent:
     """Posted by scheduler, consumed by producer."""
     incoming_track: TrackMeta
     cue_in: CuePoint
+    cue_out: Optional[CuePoint] = None   # exit cue (for choosing a style)
     n_bars: int = 8
     trigger_immediately: bool = False  # True = fire now regardless of position
 
@@ -87,8 +88,8 @@ CHUNK_FRAMES = 4096    # frames per producer iteration (~93ms at 44.1kHz)
 BUFFER_SECONDS = 8.0   # ring buffer size
 BUFFER_FRAMES  = int(BUFFER_SECONDS * SR)
 LOOKAHEAD_BARS = 16    # scheduler looks this many bars ahead for OUT cues
-MIN_DWELL_BARS = 16    # minimum bars to play before allowing early exit
-MAX_DWELL_BARS = 64    # force transition after this many bars if none found
+MIN_DWELL_BARS = 32    # minimum bars to play before mixing out (let tracks breathe)
+MAX_DWELL_BARS = 96    # force transition after this many bars if none found
 
 
 def _fmt_time(seconds: float) -> str:
@@ -148,16 +149,22 @@ def _build_crossfade_chunk(
     in_audio:  np.ndarray,
     phase: float,         # 0.0 = start of crossfade, 1.0 = end
     sr: int = SR,
+    style=None,
 ) -> np.ndarray:
     """
-    Render one chunk of the crossfade using the shared EQ blend (equal-power
-    highs + single-source bass swap), so the real-time engine and the offline
-    renderer sound identical.
+    Render one chunk of the crossfade using the shared, style-aware EQ blend
+    (or a plain equal-power fade for cuts), so the real-time engine and the
+    offline renderer sound identical.
     """
     n = min(len(out_audio), len(in_audio))
     if n == 0:
         return np.zeros((0, 2), dtype=np.float32)
-    return _apply_gain(_blend(out_audio[:n], in_audio[:n], float(phase), sr), 0.9)
+    o, ii = out_audio[:n], in_audio[:n]
+    if style is not None and style.is_cut:
+        p = float(phase)
+        fo, fi = np.cos(p * np.pi / 2), np.sin(p * np.pi / 2)
+        return _apply_gain((o * fo + ii * fi).astype(np.float32), 0.9)
+    return _apply_gain(_blend(o, ii, float(phase), sr, style), 0.9)
 
 
 # ── Stream Engine ─────────────────────────────────────────────────────────────
@@ -320,6 +327,7 @@ class StreamEngine:
         xfade_done      = 0      # frames completed in crossfade
         active_ratio    = 1.0    # stretch applied to the incoming crossfade
         active_incoming = None
+        active_style    = None   # TransitionStyle for the current crossfade
         pending         = None   # transition prepared but not yet started
 
         while self.running:
@@ -337,9 +345,9 @@ class StreamEngine:
                 inc_native = self._load_matched(inc)
 
                 ratio, beatmatched = _resolve_stretch(self.state.track.bpm, inc.bpm)
-                n_bars = evt.n_bars if beatmatched else min(4, evt.n_bars)
+                style = choose_transition_style(evt.cue_out, evt.cue_in, beatmatched)
                 if beatmatched and abs(ratio - 1.0) > 0.001:
-                    print(f"    Beatmatch: stretching {(ratio-1.0)*100:+.1f}%")
+                    print(f"    Beatmatch [{style.name}]: stretching {(ratio-1.0)*100:+.1f}%")
                     inc_stretched = _time_stretch(inc_native, SR, ratio)
                     stretched_downbeats = [d / ratio for d in inc.downbeats]
                 else:
@@ -356,6 +364,10 @@ class StreamEngine:
                     max_offset=in_bar / 2.0
                 )
                 bar_frames = int((60.0 / self.state.track.bpm) * 4 * SR)
+                if style.is_cut:
+                    xfade_total_frames = int(style.cut_seconds * SR)
+                else:
+                    xfade_total_frames = bar_frames * style.n_bars
 
                 # Defer the blend to the next outgoing downbeat for a beat-locked start
                 now_t  = pos / SR
@@ -368,7 +380,8 @@ class StreamEngine:
                     "in_native":    inc_native,
                     "in_pos":       int(aligned_t * SR),
                     "ratio":        ratio,
-                    "xfade_total":  max(1, bar_frames * n_bars),
+                    "style":        style,
+                    "xfade_total":  max(1, xfade_total_frames),
                     "start_frame":  start_frame,
                 }
 
@@ -382,6 +395,7 @@ class StreamEngine:
                 xfade_done      = 0
                 active_ratio    = pending["ratio"]
                 active_incoming = pending["incoming"]
+                active_style    = pending["style"]
                 self.state.is_mixing  = True
                 self.state.next_track = active_incoming
                 pending = None
@@ -407,7 +421,7 @@ class StreamEngine:
                 in_chunk  = in_audio[in_pos:in_pos + actual]
                 phase = min(1.0, xfade_done / xfade_total)
 
-                chunk = _build_crossfade_chunk(out_chunk, in_chunk, phase, SR)
+                chunk = _build_crossfade_chunk(out_chunk, in_chunk, phase, SR, active_style)
                 xfade_done += actual
                 in_pos     += actual
                 pos        += actual
@@ -593,6 +607,7 @@ class StreamEngine:
         evt = TransitionEvent(
             incoming_track=self.state.next_track,
             cue_in=self.state.next_cue_in,
+            cue_out=self.state.scheduled_out,
             n_bars=8,
         )
         with self._transition_lock:
@@ -638,7 +653,7 @@ class StreamEngine:
         peak = np.abs(audio).max()
         if peak > 0:
             audio = audio * (0.93 / peak)
-        sf.write(self.output_file, audio, SR, subtype='PCM_24')
+        sf.write(self.output_file, audio, SR, subtype='PCM_16')
         dur = len(audio) / SR
         mb = os.path.getsize(self.output_file) / 1024 / 1024
         print(f"\n  Written: {self.output_file} ({dur:.1f}s, {mb:.1f} MB)")

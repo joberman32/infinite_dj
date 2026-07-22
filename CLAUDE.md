@@ -69,18 +69,26 @@ infinite_dj/
 - `top_k = 5` cue points per type per track
 
 ### Mixing (`mixer.py`)
-- Shared `_blend(out, in, phase)` primitive (used by both offline renderer and real-time engine):
-  - Highs/mids: equal-power crossfade across the whole region (never both tracks at full → no mud)
-  - Bass: single-source swap around the midpoint (only one kick plays at a time)
-- Loudness-matched: incoming track gain-adjusted toward the outgoing track's (offline set uses a fixed `MASTER_LOUDNESS` target)
-- **Stretch budget** (`MAX_STRETCH = 0.08`): `TransitionPlan.__post_init__` picks the least-stretch match (direct / half / double time). Within budget → beatmatch; beyond → a short 4-bar `cut` (no tempo mangling). `plan.beatmatched` / `plan.method` expose the decision.
+- **Adaptive crossfade styles** (`TransitionStyle` / `choose_transition_style`): the crossfade's length, high-frequency slope + delay, and bass-swap timing are chosen from the energy at the exit and entry cues:
+  - `blend` (breakdown→intro, both sparse): long 16-bar smooth blend
+  - `swap` (drop→drop, both busy): short 8-bar, incoming highs held back, quick bass swap
+  - `fade` (busy→calm): medium 12-bar gentle
+  - `build` (calm→rising): short 8-bar, incoming brought up sooner
+  - `cut` (tempos incompatible): a short ~0.3s fade — never a long overlap of two unsynced grooves
+- Shared `_blend(out, in, phase, style)` primitive (offline + engine): style-shaped high crossfade + single-source bass swap (only one kick at a time)
+- Loudness-matched to a fixed `MASTER_LOUDNESS` target
+- **Stretch budget** (`MAX_STRETCH = 0.08`, half/double aware); beyond budget → `cut`
 - Time-stretch via Rubber Band; a downbeat at native time `d` maps to `d / ratio` after stretching (ratio > 1 speeds up)
-- Default mix length: 16 bars
 
 ### Full-set rendering (`render_set` in `mixer.py`)
-- Lays all tracks on ONE continuous timeline: each plays solo at its native tempo, consecutive tracks overlap only during a beat-locked crossfade, only the final track fades out. No silence gaps, no double-rendered tracks.
-- Per-transition tempo reference (the outgoing track's native tempo) — no global tempo lock/drift; only genuinely far-apart pairs become cuts.
-- Returns `(audio, sr, [SetMarker])`; `render-set` prints transition timestamps + method.
+- Lays all tracks on ONE continuous timeline: each plays solo at its native tempo, consecutive tracks overlap only during an adaptive crossfade, only the final track fades out. No silence gaps, no double-rendered tracks.
+- **Breathing room**: a track plays a substantial solo (`min_solo_bars`, default 32) and only exits at a strong, phrase-aligned OUT cue past that dwell.
+- Per-transition tempo reference (outgoing track's native tempo) — no global tempo lock/drift.
+- Output is 16-bit PCM at the source sample rate (44.1 kHz).
+- Returns `(audio, sr, [SetMarker])`; `render-set` prints transition timestamps, style + stretch.
+
+### Set sequencing (`sequence_for_mixing` in `sequencer.py`)
+- The sequencer `render-set` uses: strongly prefers beat-matchable (tempo-compatible) neighbours so the render uses gentle blends rather than hard cuts, then harmony and energy-arc fit break ties. Produces a no-repeat permutation for a full set.
 
 ### Real-time engine (`engine.py`)
 Three threads:

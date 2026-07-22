@@ -29,7 +29,7 @@ from infinite_dj.mixer import (
     best_cue_out, best_cue_in,
 )
 from infinite_dj.engine import StreamEngine
-from infinite_dj.sequencer import sequence_energy_arc, sequence_greedy
+from infinite_dj.sequencer import sequence_energy_arc, sequence_greedy, sequence_for_mixing
 
 SUPPORTED_FORMATS = (".mp3", ".flac", ".wav", ".aiff", ".aif", ".ogg", ".m4a")
 
@@ -352,24 +352,27 @@ def cmd_render_set(args):
     n = getattr(args, 'n', None) or len(tracks)
     arc = getattr(args, 'arc', 'peak')
 
-    print(f"Building {arc} energy arc sequence over {n} tracks...")
-    seq = sequence_energy_arc(tracks, arc=arc, n_tracks=n)
+    print(f"Building mix-optimized {arc} sequence over {n} tracks...")
+    seq = sequence_for_mixing(tracks, arc=arc, n_tracks=n)
     seq.describe()
 
     print(f"\nRendering continuous set ({len(seq.tracks)} tracks)...")
     audio, sr, markers = render_set(seq.tracks, n_mix_bars=16)
 
-    sf.write(args.out, audio, sr, subtype='PCM_24')
+    # 16-bit PCM at the source sample rate — matches the library's fidelity
+    # without the bloat of 24-bit.
+    sf.write(args.out, audio, sr, subtype='PCM_16')
     duration = len(audio) / sr
     mb = os.path.getsize(args.out) / 1024 / 1024
 
     print(f"\nSet rendered: {args.out}")
-    print(f"  Duration: {duration/60:.1f} min | Size: {mb:.1f} MB")
+    print(f"  {sr} Hz / 16-bit | Duration: {duration/60:.1f} min | Size: {mb:.1f} MB")
     print(f"\n  Transitions:")
     for mk in markers:
         m, s = divmod(mk.time, 60)
-        tag = f"{mk.method}" + (f" {mk.stretch_pct:+.1f}%" if mk.method == "beatmatch" else "")
-        print(f"    {int(m)}:{s:04.1f}  [{tag}]  {mk.label[:52]}")
+        detail = (f"{mk.style} {mk.stretch_pct:+.1f}%"
+                  if mk.method == "beatmatch" else f"cut ({mk.style})")
+        print(f"    {int(m)}:{s:04.1f}  [{detail}]  {mk.label[:50]}")
 
 
 def cmd_play(args):

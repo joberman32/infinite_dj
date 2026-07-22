@@ -229,28 +229,79 @@ def _loudness_match(
     return (audio * (10.0 ** (gain_db / 20.0))).astype(np.float32)
 
 
+@dataclass
+class TransitionStyle:
+    """
+    How a crossfade behaves, chosen from the two tracks' dynamics at the mix
+    point. Different exits/entries want different slopes, filtering and lengths.
+    """
+    name: str
+    n_bars: int                # crossfade length (cumulative time)
+    high_slope: float = 1.0    # >1 = incoming highs/percussion rise slower (less clash)
+    in_high_delay: float = 0.0 # phase in [0, 0.5) before incoming highs start entering
+    bass_swap_center: float = 0.5   # phase where the low end swaps tracks
+    bass_swap_width: float = 0.10   # how gradual the bass swap is
+    is_cut: bool = False       # short time-based fade instead of a bar-based blend
+    cut_seconds: float = 0.30  # length of that fade when is_cut
+
+
+def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionStyle:
+    """
+    Pick a crossfade style from the energy of the outgoing exit and incoming
+    entry. Beat-locked pairs get real blends shaped to their dynamics; tempo-
+    incompatible pairs get a short cut so two unsynced grooves never smear.
+    """
+    if not beatmatched:
+        # Tempos clash — a long overlap would phase two grooves through each
+        # other. Keep it near-instant (just enough to avoid a click).
+        return TransitionStyle("cut", n_bars=0, is_cut=True, cut_seconds=0.30)
+
+    eo = out_cue.energy if out_cue else 0.5
+    ei = in_cue.energy if in_cue else 0.5
+
+    if eo < 0.45 and ei < 0.45:
+        # Both sparse (breakdown/outro → intro): room for a long smooth blend
+        return TransitionStyle("blend", 16, high_slope=1.0, in_high_delay=0.10,
+                               bass_swap_center=0.55, bass_swap_width=0.30)
+    if eo > 0.70 and ei > 0.70:
+        # Drop → drop: hold the incoming percussion back and swap bass quickly
+        return TransitionStyle("swap", 8, high_slope=2.0, in_high_delay=0.45,
+                               bass_swap_center=0.50, bass_swap_width=0.10)
+    if eo >= ei:
+        # Exiting a busier part into a calmer one: gentle medium fade
+        return TransitionStyle("fade", 12, high_slope=1.4, in_high_delay=0.20,
+                               bass_swap_center=0.55, bass_swap_width=0.20)
+    # Exiting a calm part into a rising one: bring the incoming up sooner
+    return TransitionStyle("build", 8, high_slope=0.8, in_high_delay=0.10,
+                           bass_swap_center=0.40, bass_swap_width=0.15)
+
+
 def _blend(
     out_chunk: np.ndarray,
     in_chunk: np.ndarray,
     phase,                       # scalar or per-sample array in [0, 1]
     sr: int = MIX_SR,
+    style: Optional[TransitionStyle] = None,
     bass_cutoff: float = 200.0,
 ) -> np.ndarray:
     """
     Shared DJ-style EQ blend used by both the offline renderer and the real-time
     engine. `phase` is 0 at the start of the crossfade and 1 at the end.
 
-      - Highs/mids: equal-power crossfade across the whole region (constant
-        perceived loudness, no doubling of both tracks at full).
-      - Bass: single source at a time — the outgoing low end is held until the
-        midpoint, then swapped to the incoming over a short window, so only one
-        kick drum is ever playing (avoids the muddy two-track pile-up).
+      - Highs/mids: crossfade shaped by the style — the incoming can be delayed
+        and eased in (`in_high_delay`, `high_slope`) so its percussion doesn't
+        clash with the outgoing groove.
+      - Bass: single source at a time — swapped over a short window
+        (`bass_swap_center`/`width`), so only one kick drum ever plays.
     """
     n = min(len(out_chunk), len(in_chunk))
     if n == 0:
         return np.zeros((0, 2), dtype=np.float32)
     out_c = out_chunk[:n]
     in_c  = in_chunk[:n]
+
+    if style is None:
+        style = TransitionStyle("default", 0)
 
     phase = np.asarray(phase, dtype=np.float32)
     if phase.ndim == 0:
@@ -262,12 +313,17 @@ def _blend(
     in_bass  = _apply_lowpass(in_c, sr, bass_cutoff)
     in_high  = _apply_highpass(in_c, sr, bass_cutoff)
 
-    # Equal-power high/mid crossfade
-    a = phase * (np.pi / 2.0)
-    highs = out_high * np.cos(a) + in_high * np.sin(a)
+    # Outgoing highs fade out across the region; incoming highs enter after a
+    # delay and rise with a shaped slope (higher slope = later/steeper).
+    out_g = np.cos(phase * (np.pi / 2.0))
+    d = style.in_high_delay
+    p_in = np.clip((phase - d) / max(1e-6, 1.0 - d), 0.0, 1.0) ** style.high_slope
+    in_g = np.sin(p_in * (np.pi / 2.0))
+    highs = out_high * out_g + in_high * in_g
 
-    # Single-source bass swap over a narrow window centered on the midpoint
-    swap = np.clip((phase - 0.45) / 0.10, 0.0, 1.0) * (np.pi / 2.0)
+    # Single-source bass swap over a window centered on bass_swap_center
+    lo = style.bass_swap_center - style.bass_swap_width / 2.0
+    swap = np.clip((phase - lo) / max(1e-6, style.bass_swap_width), 0.0, 1.0) * (np.pi / 2.0)
     bass = out_bass * np.cos(swap) + in_bass * np.sin(swap)
 
     return (highs + bass).astype(np.float32)
@@ -408,8 +464,8 @@ def render_transition(plan: TransitionPlan, sr: int = MIX_SR) -> MixResult:
 
 
 def write_mix(result: MixResult, out_path: str):
-    """Write a MixResult to a WAV file."""
-    sf.write(out_path, result.audio, result.sr, subtype='PCM_24')
+    """Write a MixResult to a WAV file (16-bit, matching the source library)."""
+    sf.write(out_path, result.audio, result.sr, subtype='PCM_16')
     mb = os.path.getsize(out_path) / 1024 / 1024
     print(f"  Written: {out_path} ({result.duration:.1f}s, {mb:.1f} MB)")
 
@@ -427,6 +483,14 @@ class SetMarker:
     label: str             # "Track A → Track B"
     method: str            # "beatmatch" | "cut"
     stretch_pct: float
+    style: str = ""        # transition style name
+
+
+def _best_out_cue_after(track: TrackMeta, min_t: float, max_t: float):
+    """Strongest OUT cue in (min_t, max_t); None if the track has none there."""
+    outs = [c for c in track.cue_points
+            if c.type == "out" and min_t <= c.timestamp < max_t]
+    return max(outs, key=lambda c: c.confidence) if outs else None
 
 
 def render_set(
@@ -434,20 +498,23 @@ def render_set(
     n_mix_bars: int = 16,
     sr: int = MIX_SR,
     max_stretch: float = MAX_STRETCH,
+    min_solo_bars: int = 32,
 ) -> tuple:
     """
     Render an ordered list of tracks into ONE continuous set.
 
-    Unlike stitching independent transition clips, this lays every track on a
-    single master timeline: each track plays solo (at its own native tempo) from
-    its entry to its exit cue, and consecutive tracks overlap only during a
-    crossfade. Only the final track fades out — nothing cuts to silence mid-set.
+    Design goals:
+      - Tracks breathe: each plays a substantial solo (>= min_solo_bars) and
+        only exits at a genuinely strong, phrase-aligned OUT cue.
+      - Transitions adapt to the music: `choose_transition_style` picks the
+        length, slope, filtering and bass-swap timing from the energy at the
+        exit and entry, so a drop→drop swaps quickly while a breakdown→intro
+        blends long. Tempo-incompatible pairs get a short cut, never a long
+        overlap of two unsynced grooves.
 
-    Beatmatching is per-transition: the incoming track's crossfade region is
-    time-stretched to the *outgoing* track's native tempo so the overlap is
-    beat-locked, then the incoming continues its solo at its own tempo. This
-    avoids the tempo drift of a global lock and keeps cuts to only those pairs
-    genuinely too far apart to match. Returns (audio, sr, [SetMarker, ...]).
+    Each track plays at its own native tempo; only the incoming crossfade region
+    is stretched to the outgoing tempo for a beat-locked overlap. Returns
+    (audio, sr, [SetMarker, ...]).
     """
     if len(tracks) < 2:
         raise ValueError("Need at least 2 tracks to render a set")
@@ -469,24 +536,12 @@ def render_set(
     written = 0
 
     for i in range(len(tracks) - 1):
-        nxt_t = tracks[i + 1]
-        out_bpm  = cur_t.bpm
-        out_bar_s = _time_to_samples((60.0 / out_bpm) * 4, sr)
-        min_solo  = out_bar_s * 8    # at least 8 bars solo before mixing out
-
-        # ── Outgoing cue: a downbeat with room for a solo section ──────────────
-        db_samples = [_time_to_samples(d, sr) for d in cur_t.downbeats]
-        best_out = best_cue_out(cur_t)
-        best_out_sample = _time_to_samples(best_out.timestamp, sr) if best_out else -1
-        lower = read + min_solo
-        cands = [d for d in db_samples if lower <= d < len(cur_audio)]
-        if cands:
-            cue_out_sample = (
-                min(cands, key=lambda d: abs(d - best_out_sample))
-                if best_out_sample >= lower else cands[0]
-            )
-        else:
-            cue_out_sample = max(read, len(cur_audio) - 1)
+        nxt_t     = tracks[i + 1]
+        out_bpm   = cur_t.bpm
+        out_bar_sec = (60.0 / out_bpm) * 4
+        out_bar_s = _time_to_samples(out_bar_sec, sr)
+        cur_dur   = len(cur_audio) / sr
+        read_t    = read / sr
 
         # ── Tempo match: bring incoming to the OUTGOING track's native tempo ───
         ratios = [out_bpm / nxt_t.bpm,
@@ -494,28 +549,48 @@ def render_set(
                   out_bpm / (nxt_t.bpm / 2.0)]
         ratio = min(ratios, key=lambda r: abs(r - 1.0))
         beatmatched = abs(ratio - 1.0) <= max_stretch
-        n_bars = n_mix_bars if beatmatched else min(4, n_mix_bars)
 
-        nxt_audio = load_matched(nxt_t)
-        in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
-
-        # ── Incoming entry point (native downbeat) ─────────────────────────────
-        cin = best_cue_in(nxt_t)
-        in_time = cin.timestamp if cin else (nxt_t.downbeats[0] if nxt_t.downbeats else 0.0)
+        # ── Incoming entry: strongest IN cue, snapped to a downbeat ────────────
+        in_cue  = best_cue_in(nxt_t)
+        in_time = in_cue.timestamp if in_cue else (nxt_t.downbeats[0] if nxt_t.downbeats else 0.0)
         in_time = _find_nearest_downbeat(
             in_time, nxt_t.downbeats, max_offset=(60.0 / nxt_t.bpm) * 4 / 2.0
         )
         in_sample = _time_to_samples(in_time, sr)
 
-        # ── Crossfade regions ──────────────────────────────────────────────────
-        out_mix = cur_audio[cue_out_sample:cue_out_sample + n_bars * out_bar_s]
-        in_region = nxt_audio[in_sample:in_sample + n_bars * in_bar_s]
-        if beatmatched and abs(ratio - 1.0) > 0.001:
-            # Stretch the incoming region to the outgoing tempo (bars now align)
-            in_mix = _time_stretch(in_region, sr, ratio)
+        # ── Outgoing exit: let the track breathe, then leave at a strong cue ───
+        min_exit_t = read_t + min_solo_bars * out_bar_sec
+        out_cue = _best_out_cue_after(cur_t, min_exit_t, cur_dur)
+        if out_cue is not None:
+            cue_out_t = out_cue.timestamp
         else:
-            ratio = 1.0
-            in_mix = in_region
+            # No strong cue after the dwell — exit on the next downbeat past it.
+            later = [d for d in cur_t.downbeats if min_exit_t <= d < cur_dur]
+            cue_out_t = later[0] if later else max(read_t, cur_dur - out_bar_sec)
+        cue_out_sample = max(read, _time_to_samples(cue_out_t, sr))
+
+        # ── Pick a crossfade style from the two tracks' dynamics ───────────────
+        style = choose_transition_style(out_cue, in_cue, beatmatched)
+
+        nxt_audio = load_matched(nxt_t)
+        in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
+
+        # ── Build the crossfade regions ────────────────────────────────────────
+        if style.is_cut:
+            # Short time-based fade — no long overlap of unsynced tempos.
+            mix_out_s = _time_to_samples(style.cut_seconds, sr)
+            out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
+            in_mix  = nxt_audio[in_sample:in_sample + mix_out_s]
+            ratio   = 1.0
+        else:
+            mix_out_s = style.n_bars * out_bar_s
+            out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
+            in_region = nxt_audio[in_sample:in_sample + style.n_bars * in_bar_s]
+            if beatmatched and abs(ratio - 1.0) > 0.001:
+                in_mix = _time_stretch(in_region, sr, ratio)   # → outgoing tempo
+            else:
+                ratio = 1.0
+                in_mix = in_region
 
         m = min(len(out_mix), len(in_mix))
         out_mix, in_mix = out_mix[:m], in_mix[:m]
@@ -527,18 +602,19 @@ def render_set(
 
         # ── 2. Crossfade ───────────────────────────────────────────────────────
         if m > 0:
-            if beatmatched:
-                phase = np.linspace(0.0, 1.0, m, dtype=np.float32)
-                xf = _blend(out_mix, in_mix, phase, sr)
-            else:
+            if style.is_cut:
                 fo, fi = _equal_power_fade(m)
                 xf = out_mix * fo.reshape(-1, 1) + in_mix * fi.reshape(-1, 1)
+            else:
+                phase = np.linspace(0.0, 1.0, m, dtype=np.float32)
+                xf = _blend(out_mix, in_mix, phase, sr, style)
             xf = _apply_gain(xf, 0.9)
             markers.append(SetMarker(
                 time=(written + len(solo)) / sr,
                 label=f"{cur_t.title} → {nxt_t.title}",
                 method="beatmatch" if beatmatched else "cut",
                 stretch_pct=(ratio - 1.0) * 100.0,
+                style=style.name,
             ))
             master.append(xf)
             written += len(solo) + len(xf)
@@ -546,7 +622,6 @@ def render_set(
             written += len(solo)
 
         # ── Advance: incoming becomes current, continuing at its native tempo ──
-        # Native samples of the incoming consumed by the (stretched) crossfade.
         consumed_in = int(round(m * ratio))
         cur_t     = nxt_t
         cur_audio = nxt_audio

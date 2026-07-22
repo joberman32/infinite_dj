@@ -143,6 +143,88 @@ def sequence_greedy(
     )
 
 
+def _beatmatchable(a_bpm: float, b_bpm: float, max_stretch: float = 0.08) -> bool:
+    """True if b can be beat-locked to a within the stretch budget (incl. half/double)."""
+    ratios = [a_bpm / b_bpm, a_bpm / (b_bpm * 2.0), a_bpm / (b_bpm / 2.0)]
+    return min(abs(r - 1.0) for r in ratios) <= max_stretch
+
+
+def sequence_for_mixing(
+    tracks: List[TrackMeta],
+    arc: str = "peak",
+    n_tracks: Optional[int] = None,
+    max_stretch: float = 0.08,
+    seed: Optional[int] = None,
+) -> Sequence:
+    """
+    Order tracks for a smooth mixed set: strongly prefer beat-matchable
+    (tempo-compatible) neighbours so the render uses gentle blends rather than
+    hard cuts, while still respecting harmony and the energy arc.
+
+    This is the sequencer `render-set` uses — it trades some energy-arc
+    precision for far fewer jarring tempo cuts.
+    """
+    if seed is not None:
+        random.seed(seed)
+    if not tracks:
+        return Sequence(tracks=[], edges=[], total_duration=0)
+
+    n = n_tracks or len(tracks)
+    graph = build_compatibility_graph(tracks)
+    track_map = {t.file_path: t for t in tracks}
+
+    # Energy-arc target (same shapes as sequence_energy_arc)
+    positions = np.linspace(0, 1, n)
+    if arc == "build":
+        target = 0.2 + positions * 0.8
+    elif arc == "steady":
+        target = np.full(n, 0.7)
+    elif arc == "wave":
+        target = np.clip(0.4 + 0.5 * np.sin(positions * 2 * np.pi), 0, 1)
+    else:  # peak
+        target = np.where(positions < 0.6,
+                          0.3 + positions / 0.6 * 0.7,
+                          1.0 - (positions - 0.6) / 0.4 * 0.6)
+
+    def mean_energy(t):
+        return float(np.mean(t.energy_curve)) if t.energy_curve else 0.5
+
+    def energy_fit(t, pos):
+        return max(0.0, 1.0 - abs(target[min(pos, n - 1)] - mean_energy(t)) * 2)
+
+    # Start near the arc's opening energy
+    current = max(tracks, key=lambda t: energy_fit(t, 0))
+    seq_tracks, seq_edges = [current], []
+    used = {current.file_path}
+
+    while len(seq_tracks) < n:
+        pos = len(seq_tracks)
+        # Prefer tracks not yet used (a full set should be a permutation); only
+        # fall back to repeats if nothing unused is reachable.
+        candidates = [e for e in graph[current.file_path] if e.track_b not in used]
+        if not candidates:
+            candidates = graph[current.file_path]
+        if not candidates:
+            break
+
+        def score(e):
+            t = track_map[e.track_b]
+            # Beatmatchability dominates so the render avoids cuts; harmony and
+            # energy-arc fit break ties.
+            bm = 1.0 if _beatmatchable(current.bpm, t.bpm, max_stretch) else 0.0
+            return 2.0 * bm + e.harmonic + 0.5 * energy_fit(t, pos)
+
+        chosen = max(candidates, key=score)
+        nxt = track_map[chosen.track_b]
+        seq_tracks.append(nxt)
+        seq_edges.append(chosen)
+        used.add(nxt.file_path)
+        current = nxt
+
+    return Sequence(tracks=seq_tracks, edges=seq_edges,
+                    total_duration=sum(t.duration for t in seq_tracks))
+
+
 def sequence_energy_arc(
     tracks: List[TrackMeta],
     arc: str = "peak",
