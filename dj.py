@@ -48,8 +48,24 @@ RENDER_IGNORE_GLOBS = (
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+def _analyze_file_worker(fpath: str):
+    """Top-level worker function for ProcessPoolExecutor."""
+    import time
+    t0 = time.time()
+    try:
+        meta = analyze_track(fpath, verbose=False)
+        elapsed = time.time() - t0
+        return (fpath, meta, None, elapsed)
+    except Exception as e:
+        elapsed = time.time() - t0
+        return (fpath, None, str(e), elapsed)
+
+
 def cmd_analyze(args):
     """Scan a directory, analyze any new or changed tracks, save to DB."""
+    import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     db = TrackDB(args.db)
     music_dir = args.music_dir
 
@@ -57,7 +73,6 @@ def cmd_analyze(args):
         print(f"Error: {music_dir} is not a directory.")
         sys.exit(1)
 
-    # Build the ignore list (skip our own renders unless told otherwise)
     ignore_globs = list(getattr(args, 'exclude', None) or [])
     if not getattr(args, 'include_renders', False):
         ignore_globs += list(RENDER_IGNORE_GLOBS)
@@ -65,7 +80,6 @@ def cmd_analyze(args):
     def _is_ignored(fname):
         return any(fnmatch.fnmatch(fname.lower(), g.lower()) for g in ignore_globs)
 
-    # Collect audio files
     files = []
     ignored = 0
     for root, _, fnames in os.walk(music_dir):
@@ -81,33 +95,76 @@ def cmd_analyze(args):
     ignored_note = f" ({ignored} excluded)" if ignored else ""
     print(f"Found {len(files)} audio files in {music_dir}{ignored_note}\n")
 
-    analyzed = 0
-    skipped  = 0
-
-    for i, fpath in enumerate(files, 1):
-        fname = os.path.basename(fpath)
-
+    # Filter out cached files fast in main process
+    to_analyze = []
+    skipped = 0
+    for fpath in files:
         if not args.force and not db.needs_analysis(fpath):
-            print(f"[{i}/{len(files)}] Skipping (cached): {fname}")
             skipped += 1
-            continue
+        else:
+            to_analyze.append(fpath)
 
-        print(f"[{i}/{len(files)}] Analyzing: {fname}")
-        try:
-            meta = analyze_track(fpath)
-            db.save(meta)
-            analyzed += 1
-            print()
-        except Exception as e:
-            print(f"  ERROR: {e}\n")
+    if skipped > 0:
+        print(f"Skipping {skipped} previously analyzed track(s) (cached).")
 
+    if not to_analyze:
+        stats = db.stats()
+        print(f"\n{'─'*50}")
+        print(f"Done. 0 analyzed, {skipped} skipped.")
+        if stats['n']:
+            print(f"Library: {stats['n']} tracks | "
+                  f"Avg BPM: {stats['avg_bpm']:.1f} | "
+                  f"Avg duration: {stats['avg_dur']/60:.1f}m")
+        db.close()
+        return
+
+    # Determine workers count
+    cpu_cores = os.cpu_count() or 4
+    num_workers = args.workers if (getattr(args, 'workers', None) and args.workers > 0) else min(cpu_cores, 8)
+    if len(to_analyze) == 1:
+        num_workers = 1
+
+    print(f"Analyzing {len(to_analyze)} track(s) using {num_workers} parallel worker(s)...\n")
+
+    analyzed = 0
+    t_start_batch = time.time()
+
+    if num_workers == 1:
+        for i, fpath in enumerate(to_analyze, 1):
+            fname = os.path.basename(fpath)
+            print(f"[{i}/{len(to_analyze)}] Analyzing: {fname}")
+            try:
+                meta = analyze_track(fpath, verbose=True)
+                db.save(meta)
+                analyzed += 1
+                print()
+            except Exception as e:
+                print(f"  ERROR: {e}\n")
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_file = {executor.submit(_analyze_file_worker, fpath): fpath for fpath in to_analyze}
+            for i, future in enumerate(as_completed(future_to_file), 1):
+                fpath, meta, err, elapsed = future.result()
+                fname = os.path.basename(fpath)
+                if err:
+                    print(f"[{i}/{len(to_analyze)}] ERROR ({elapsed:.1f}s): {fname} -> {err}")
+                else:
+                    db.save(meta)
+                    analyzed += 1
+                    n_emb = sum(1 for c in meta.cue_points if c.embedding is not None)
+                    emb_str = f", {n_emb} CLAP" if n_emb > 0 else ""
+                    print(f"[{i}/{len(to_analyze)}] Analyzed ({elapsed:.1f}s): {meta.title} [{meta.bpm:.1f} BPM, {meta.key}{emb_str}]")
+
+    total_batch_time = time.time() - t_start_batch
     stats = db.stats()
     print(f"\n{'─'*50}")
-    print(f"Done. {analyzed} analyzed, {skipped} skipped.")
-    print(f"Library: {stats['n']} tracks | "
-          f"Avg BPM: {stats['avg_bpm']:.1f} | "
-          f"Avg duration: {stats['avg_dur']/60:.1f}m")
+    print(f"Done in {total_batch_time:.1f}s. {analyzed} analyzed, {skipped} skipped.")
+    if stats['n']:
+        print(f"Library: {stats['n']} tracks | "
+              f"Avg BPM: {stats['avg_bpm']:.1f} | "
+              f"Avg duration: {stats['avg_dur']/60:.1f}m")
     db.close()
+
 
 
 def cmd_library(args):
@@ -187,8 +244,9 @@ def cmd_inspect(args):
         ts  = f"{int(c.timestamp//60)}:{int(c.timestamp%60):02d}"
         tag = "←" if c.type == "in" else "→"
         ph  = "♦" if c.phrase_aligned else " "
+        emb = " [CLAP]" if (c.embedding is not None and len(c.embedding) > 0) else ""
         bar = "▓" * int(c.confidence * 15)
-        print(f"    {ts}  {tag} {c.type.upper():<3}  {ph}  conf {c.confidence:.2f}  {bar}")
+        print(f"    {ts}  {tag} {c.type.upper():<3}  {ph}  conf {c.confidence:.2f}{emb}  {bar}")
 
     print(f"\n  Energy curve (normalized, 1s bins):")
     curve = track.energy_curve
@@ -216,13 +274,15 @@ def cmd_cues(args):
     for c in ins:
         ts = f"{int(c.timestamp//60)}:{int(c.timestamp%60):02d}.{int((c.timestamp%1)*10)}"
         ph = " [phrase]" if c.phrase_aligned else ""
-        print(f"    {ts}  conf={c.confidence:.3f}  energy={c.energy:.3f}{ph}")
+        emb = " [512D CLAP]" if (c.embedding is not None and len(c.embedding) > 0) else ""
+        print(f"    {ts}  conf={c.confidence:.3f}  energy={c.energy:.3f}{ph}{emb}")
 
     print("\n  OUT points (exit here):")
     for c in outs:
         ts = f"{int(c.timestamp//60)}:{int(c.timestamp%60):02d}.{int((c.timestamp%1)*10)}"
         ph = " [phrase]" if c.phrase_aligned else ""
-        print(f"    {ts}  conf={c.confidence:.3f}  energy={c.energy:.3f}{ph}")
+        emb = " [512D CLAP]" if (c.embedding is not None and len(c.embedding) > 0) else ""
+        print(f"    {ts}  conf={c.confidence:.3f}  energy={c.energy:.3f}{ph}{emb}")
 
 
 def cmd_compatible(args):
@@ -245,8 +305,7 @@ def cmd_compatible(args):
 
     results.sort(key=lambda x: -x[0])
 
-    print(f"\nCompatible tracks for: {source.title} [{source.key}, {source.bpm:.1f} BPM]")
-    print(f"{'─'*70}")
+    print(f"\nTop {top_n} matches for: {source.title} [{source.key}, {source.bpm:.1f} BPM]")
     print(f"  {'Score':<7} {'Harm':<7} {'Rhythm':<8} {'Key':<6} {'BPM':<8} Title")
     print(f"  {'─'*65}")
 
@@ -262,8 +321,9 @@ def cmd_mix(args):
     track_b = _find_track(db, args.track_b)
     db.close()
 
-    cue_out = best_cue_out(track_a)
-    cue_in  = best_cue_in(track_b)
+    from infinite_dj.sequencer import find_best_cue_pair, cue_cosine_similarity
+    cue_out, cue_in, pair_score = find_best_cue_pair(track_a, track_b)
+    sim = cue_cosine_similarity(cue_out, cue_in) if (cue_out and cue_in) else None
 
     if not cue_out:
         print(f"Warning: no OUT cue points found for '{track_a.title}', using mid-point.")
@@ -292,11 +352,13 @@ def cmd_mix(args):
         n_mix_bars=n_bars,
     )
 
+    sim_str = f"  |  CLAP Similarity: {sim:.3f}" if sim is not None else ""
     print(f"\nMix plan:")
     print(f"  OUT: {track_a.title} [{track_a.key}, {track_a.bpm:.1f} BPM]")
     print(f"       cue at {cue_out.timestamp:.1f}s (confidence {cue_out.confidence:.2f})")
     print(f"  IN:  {track_b.title} [{track_b.key}, {track_b.bpm:.1f} BPM]")
     print(f"       cue at {cue_in.timestamp:.1f}s (confidence {cue_in.confidence:.2f})")
+    print(f"  Cue Match Score: {pair_score:.3f}{sim_str}")
     if plan.beatmatched:
         print(f"  Method: beatmatch ({(plan.stretch_ratio-1)*100:+.1f}% stretch)  |  Mix: {n_bars} bars\n")
     else:
@@ -439,10 +501,13 @@ def main():
     p_analyze.add_argument("music_dir")
     p_analyze.add_argument("--force", action="store_true",
                            help="Re-analyze even if cached")
+    p_analyze.add_argument("--workers", type=int, default=None,
+                           help="Number of parallel worker processes (default: auto CPU count)")
     p_analyze.add_argument("--exclude", action="append", metavar="GLOB",
                            help="Skip files matching this glob (repeatable)")
     p_analyze.add_argument("--include-renders", action="store_true",
                            help="Also analyze this tool's own rendered sets/transitions")
+
 
     # library
     sub.add_parser("library", help="List all analyzed tracks")

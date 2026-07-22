@@ -2,6 +2,15 @@
 
 Auto-mixing DJ engine for local music libraries. Analyzes tracks once, then sequences and mixes them in real-time — beat-matched, harmonically compatible, with 3-phase EQ crossfades that can fire at any point in a track.
 
+## Change history for agents
+
+Before modifying analysis, sequencing, mixing, buffering, or live playback,
+read [CHANGELOG.md](CHANGELOG.md). It records the behavior changes made in this
+repository and the reasoning behind them, including real-time constraints that
+are not always apparent from an individual module. Add an entry there for any
+meaningful behavior or architecture change, explaining both what changed and
+why.
+
 ## Setup
 
 ```bash

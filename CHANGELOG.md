@@ -1,0 +1,68 @@
+# Changelog
+
+This file records meaningful behavior and architecture changes, including why
+they were made. Read it before changing the mixing or playback pipeline: it
+captures constraints that may not be obvious from a local code path.
+
+## 2026-07-21 — Multi-Core Parallel Library Analysis
+
+- Upgraded `dj.py analyze` command to use Python's `concurrent.futures.ProcessPoolExecutor` for multi-core parallel processing (`dj.py`, `analyzer.py`).
+- Added `--workers N` CLI flag (defaulting to CPU core count up to 8 workers), speeding up batch library analysis by 4–8x.
+- Added `verbose: bool = True` to `analyze_track()` to suppress worker sub-task output while maintaining real-time batch progress logging in the main process (`analyzer.py`).
+- Preserved single-threaded SQLite write operations in the main process (`db.save(meta)`) for thread and process safety (`dj.py`).
+- Added test coverage in `tests/test_parallel_analysis.py`.
+
+## 2026-07-21 — CLAP Neural Audio Embedding Integration
+
+
+- Integrated HuggingFace **CLAP** (`laion/clap-htsat-fused`) embeddings for timbral and structural cue-point pairing.
+- Extracted 512-dimensional L2-normalized feature vectors for 8-second audio windows surrounding every top-K `IN` and `OUT` cue point (`embeddings.py`, `cue_detector.py`, `analyzer.py`).
+- Added optional `embedding` field to `CuePoint` dataclass and serialized it into SQLite JSON columns for backward-compatible database persistence (`models.py`, `db.py`).
+- Implemented `cue_cosine_similarity` and `find_best_cue_pair` in `sequencer.py` to pair `OUT` and `IN` cue points based on acoustic vector similarity, phrase alignment, and cue confidence.
+- Updated `build_compatibility_graph` in `sequencer.py` to factor CLAP cue similarity into set sequencing decisions (40% harmonic, 30% rhythm, 30% CLAP cue similarity).
+- Updated `choose_transition_style` in `mixer.py` to select smooth 16-bar `blend` transitions for high CLAP vector similarity ($\ge 0.82$).
+- Added CLI reporting for CLAP embedding status in `inspect`, `cues`, and `mix` subcommands (`dj.py`).
+- Added comprehensive unit test suite in `tests/test_embeddings.py` covering serialization, vector math, pairing logic, and DB roundtrips.
+- **2026-07-22 follow-up**: torch/transformers moved out of `requirements.txt`
+  into optional `requirements-clap.txt` (~2 GB; the base pipeline must stay
+  lightweight). Status: not yet validated with the real model — no library DB
+  contains embeddings, and the 0.82 blend threshold is untuned. Everything
+  falls back to energy/harmony matching when embeddings are absent.
+
+## 2026-07-21 — Real-time transition reliability
+
+
+Commit: `3df2794 Harden real-time transition playback`
+
+- Scheduler-selected OUT cues now determine the exact start of a normal
+  transition. The previous producer behavior replaced the selected cue with
+  whichever downbeat came next, which could start the mix up to eight bars
+  early. Forced skips and cue-less fallback transitions retain their separate,
+  safe behavior.
+
+- Live crossfades use a per-sample phase ramp rather than a single gain value
+  for each 4096-frame producer chunk. This prevents audible gain/EQ stepping.
+  EQ filter state is also preserved for the duration of a transition so every
+  chunk does not restart its filters and introduce a transient.
+
+- Incoming tracks are decoded, loudness-matched, time-stretched, and
+  downbeat-aligned in a background preparation thread as soon as the scheduler
+  selects them. The producer must keep the output buffer full, so it must not
+  perform full-track I/O or Rubber Band processing during a handoff. If
+  preparation is late, playback continues and the handoff waits for a safe
+  future downbeat.
+
+- The deque-and-lock output buffer was replaced with a preallocated,
+  single-producer/single-consumer stereo ring buffer. The audio callback no
+  longer takes a mutex or allocates its output buffer. It fills underflows with
+  silence and records underruns; producer-side waiting occurs only when the
+  ring is full.
+
+- Render time and audible time are distinct. The producer remains ahead so it
+  can write a future transition into the buffer, while playback/session time
+  advances only when frames are consumed. Scheduler dwell and cue policy use a
+  latency-compensated audible track position.
+
+- Added regression coverage for cue timing, asynchronous preparation, seamless
+  chunked DSP, ring-buffer ordering/underflow behavior, and latency
+  compensation. The suite passed with the repository `.venv`.

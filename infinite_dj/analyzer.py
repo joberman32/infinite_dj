@@ -270,7 +270,7 @@ def _compute_loudness(y) -> float:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def analyze_track(file_path: str) -> TrackMeta:
+def analyze_track(file_path: str, verbose: bool = True) -> TrackMeta:
     """
     Full analysis pipeline for a single audio file.
 
@@ -285,34 +285,38 @@ def analyze_track(file_path: str) -> TrackMeta:
 
     Returns a TrackMeta object ready to be persisted to the DB.
     """
-    print(f"  Loading:    {os.path.basename(file_path)}")
+    def log(msg, end="\n", flush=False):
+        if verbose:
+            print(msg, end=end, flush=flush)
+
+    log(f"  Loading:    {os.path.basename(file_path)}")
     y, sr = librosa.load(file_path, sr=SR, mono=True)
     duration = float(len(y) / sr)
 
-    print(f"  BPM/beats...", end=" ", flush=True)
+    log(f"  BPM/beats...", end=" ", flush=True)
     bpm, bpm_conf, beats, downbeats = _compute_beats(y, sr)
-    print(f"{bpm:.1f} BPM ({len(beats)} beats)")
+    log(f"{bpm:.1f} BPM ({len(beats)} beats)")
 
-    print(f"  Phrases...", end=" ", flush=True)
+    log(f"  Phrases...", end=" ", flush=True)
     phrases = _compute_phrases(downbeats)
-    print(f"{len(phrases)} phrase boundaries")
+    log(f"{len(phrases)} phrase boundaries")
 
-    print(f"  Key...", end=" ", flush=True)
+    log(f"  Key...", end=" ", flush=True)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
     camelot, key_name, key_conf = detect_key(chroma)
-    print(f"{key_name} ({camelot}), confidence {key_conf:.2f}")
+    log(f"{key_name} ({camelot}), confidence {key_conf:.2f}")
 
-    print(f"  Energy...", end=" ", flush=True)
+    log(f"  Energy...", end=" ", flush=True)
     energy_curve = _compute_energy_curve(y, sr)
-    print(f"{len(energy_curve)}s curve")
+    log(f"{len(energy_curve)}s curve")
 
-    print(f"  Sections...", end=" ", flush=True)
+    log(f"  Sections...", end=" ", flush=True)
     sections = _compute_sections(y, sr, energy_curve, duration)
-    print(f"{len(sections)} sections: {[s.label for s in sections]}")
+    log(f"{len(sections)} sections: {[s.label for s in sections]}")
 
     loudness = _compute_loudness(y)
 
-    print(f"  Cue points...", end=" ", flush=True)
+    log(f"  Cue points...", end=" ", flush=True)
     spectral_flatness = _compute_spectral_flatness(y, sr)
     cue_points = detect_cue_points(
         downbeats=downbeats,
@@ -323,10 +327,12 @@ def analyze_track(file_path: str) -> TrackMeta:
         hop_length=HOP_LENGTH,
         duration=duration,
         top_k=5,
+        y=y,
     )
     n_in  = sum(1 for c in cue_points if c.type == "in")
     n_out = sum(1 for c in cue_points if c.type == "out")
-    print(f"{n_in} IN, {n_out} OUT")
+    n_emb = sum(1 for c in cue_points if c.embedding is not None)
+    log(f"{n_in} IN, {n_out} OUT ({n_emb} CLAP embedded)")
 
     title = os.path.splitext(os.path.basename(file_path))[0]
 
@@ -348,3 +354,4 @@ def analyze_track(file_path: str) -> TrackMeta:
         analyzed_at=time.time(),
         loudness=loudness,
     )
+
