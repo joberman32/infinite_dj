@@ -31,7 +31,8 @@ class Section:
     """A detected structural segment of a track."""
     start: float
     end: float
-    label: str        # "intro", "build", "drop", "breakdown", "outro", "body"
+    label: str        # dynamics-based, genre-neutral: intro / rising / peak /
+                      # steady / falling / sparse / outro
     energy: float     # mean normalized RMS energy in this section
 
     def to_dict(self):

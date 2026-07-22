@@ -227,21 +227,33 @@ def _compute_sections(y, sr, energy_curve: list, duration: float) -> list:
 
         t_start = max(0, int(start))
         t_end   = min(len(energy_curve), int(end))
-        seg_energy = float(np.mean(energy_curve[t_start:t_end])) if t_end > t_start else 0.0
+        seg = energy_curve[t_start:t_end]
+        seg_energy = float(np.mean(seg)) if len(seg) else 0.0
 
+        # Energy trend within the section (rising / falling / flat), so labels
+        # describe dynamics rather than genre-specific structure.
+        if len(seg) >= 6:
+            third = max(1, len(seg) // 3)
+            trend = float(np.mean(seg[-third:]) - np.mean(seg[:third]))
+        else:
+            trend = 0.0
+
+        # Genre-neutral vocabulary: works for ambient / IDM / rock, not just EDM.
         pos = start / duration
         if pos < 0.12 and seg_energy < 0.45:
             label = "intro"
         elif pos > 0.85 and seg_energy < 0.5:
             label = "outro"
-        elif seg_energy > 0.75:
-            label = "drop"
-        elif seg_energy > 0.5:
-            label = "build"
-        elif seg_energy < 0.3:
-            label = "breakdown"
+        elif seg_energy < 0.30:
+            label = "sparse"
+        elif trend > 0.08:
+            label = "rising"
+        elif trend < -0.08:
+            label = "falling"
+        elif seg_energy > 0.70:
+            label = "peak"
         else:
-            label = "body"
+            label = "steady"
 
         sections.append(Section(
             start=round(start, 2),
