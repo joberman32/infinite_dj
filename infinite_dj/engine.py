@@ -50,7 +50,8 @@ from .models import TrackMeta, CuePoint
 from .mixer import (
     _load_audio, _time_stretch, _apply_lowpass, _apply_highpass,
     _equal_power_fade, _apply_gain, _find_nearest_downbeat,
-    TransitionPlan, MIX_SR as SR
+    _blend, _loudness_match, TransitionPlan, MAX_STRETCH, MASTER_LOUDNESS,
+    MIX_SR as SR
 )
 from .sequencer import build_compatibility_graph, sequence_energy_arc
 from .harmony import camelot_compatibility, bpm_compatibility
@@ -128,6 +129,20 @@ def _pick_best_in_cue(track: TrackMeta, after: float = 0.0) -> Optional[CuePoint
     return max(ins, key=lambda c: c.confidence)
 
 
+def _resolve_stretch(out_bpm: float, in_bpm: float,
+                     max_stretch: float = MAX_STRETCH) -> tuple:
+    """
+    Least-stretch ratio (considering half/double time) to bring the incoming
+    tempo to the outgoing one. Returns (ratio, beatmatched). If the best match
+    still exceeds the budget, beatmatched is False and the caller should cut.
+    """
+    ratios = [out_bpm / in_bpm, out_bpm / (in_bpm * 2.0), out_bpm / (in_bpm / 2.0)]
+    ratio = min(ratios, key=lambda r: abs(r - 1.0))
+    if abs(ratio - 1.0) <= max_stretch:
+        return ratio, True
+    return 1.0, False
+
+
 def _build_crossfade_chunk(
     out_audio: np.ndarray,
     in_audio:  np.ndarray,
@@ -135,35 +150,14 @@ def _build_crossfade_chunk(
     sr: int = SR,
 ) -> np.ndarray:
     """
-    Render one chunk of the 3-phase EQ crossfade.
-    phase is the position within the crossfade region (0-1).
+    Render one chunk of the crossfade using the shared EQ blend (equal-power
+    highs + single-source bass swap), so the real-time engine and the offline
+    renderer sound identical.
     """
     n = min(len(out_audio), len(in_audio))
     if n == 0:
         return np.zeros((0, 2), dtype=np.float32)
-
-    out_chunk = out_audio[:n]
-    in_chunk  = in_audio[:n]
-
-    out_bass = _apply_lowpass(out_chunk, sr)
-    out_high = _apply_highpass(out_chunk, sr)
-    in_bass  = _apply_lowpass(in_chunk, sr)
-    in_high  = _apply_highpass(in_chunk, sr)
-
-    if phase < 0.33:
-        # Phase 1: out full, in highs fade in
-        t = phase / 0.33
-        result = out_chunk + in_high * t
-    elif phase < 0.66:
-        # Phase 2: bass swap
-        t = (phase - 0.33) / 0.33
-        result = out_high + out_bass * (1 - t) + in_high + in_bass * t
-    else:
-        # Phase 3: in full, out highs fade out
-        t = (phase - 0.66) / 0.34
-        result = out_high * (1 - t) + in_chunk
-
-    return _apply_gain(result, 0.85)
+    return _apply_gain(_blend(out_audio[:n], in_audio[:n], float(phase), sr), 0.9)
 
 
 # ── Stream Engine ─────────────────────────────────────────────────────────────
@@ -290,13 +284,18 @@ class StreamEngine:
 
     # ── Internal state ────────────────────────────────────────────────────────
 
+    def _load_matched(self, t: TrackMeta) -> np.ndarray:
+        """Load a track's audio, normalized to the shared set loudness."""
+        audio, _ = _load_audio(t.file_path, SR)
+        return _loudness_match(audio, t.loudness, MASTER_LOUDNESS)
+
     def _load_current_track(self):
         """Load current track audio into memory."""
         t = self.state.track
         if not t:
             return
         print(f"  ▶ Loading: {t.title} [{t.key}, {t.bpm:.0f} BPM]")
-        self._current_audio, _ = _load_audio(t.file_path, SR)
+        self._current_audio = self._load_matched(t)
         self._current_pos_frame = 0
         self._recently_played.append(t.file_path)
         self.state.position = 0.0
@@ -314,10 +313,14 @@ class StreamEngine:
         current_audio = self._current_audio
         pos = 0  # frame position in current_audio
 
-        in_audio     = None   # incoming track audio (during crossfade)
-        in_pos       = 0      # frame in incoming audio
-        xfade_total  = 0      # total crossfade frames
-        xfade_done   = 0      # frames completed in crossfade
+        in_audio        = None   # incoming (stretched-to-outgoing-tempo) audio
+        in_native       = None   # incoming native audio, for post-mix handoff
+        in_pos          = 0      # frame in in_audio
+        xfade_total     = 0      # total crossfade frames
+        xfade_done      = 0      # frames completed in crossfade
+        active_ratio    = 1.0    # stretch applied to the incoming crossfade
+        active_incoming = None
+        pending         = None   # transition prepared but not yet started
 
         while self.running:
             # Check for a queued transition
@@ -326,34 +329,62 @@ class StreamEngine:
                 if evt:
                     self._transition_queue = None
 
-            if evt is not None and not self.state.is_mixing:
-                # Load incoming track
-                print(f"\n  ⟶ Transitioning to: {evt.incoming_track.title}")
-                inc_audio, _ = _load_audio(evt.incoming_track.file_path, SR)
+            # Prepare a newly-queued transition up front (load/stretch/align) so
+            # the actual start can be deferred to an outgoing downbeat.
+            if evt is not None and not self.state.is_mixing and pending is None:
+                inc = evt.incoming_track
+                print(f"\n  ⟶ Preparing transition to: {inc.title}")
+                inc_native = self._load_matched(inc)
 
-                # Time-stretch if BPM differs
-                ratio = self.state.track.bpm / evt.incoming_track.bpm
-                if abs(ratio - 1.0) > 0.005:
-                    pct = (ratio - 1.0) * 100
-                    print(f"    Stretching +{pct:.1f}%...")
-                    inc_audio = _time_stretch(inc_audio, SR, ratio)
-                    stretched_downbeats = [d * ratio for d in evt.incoming_track.downbeats]
+                ratio, beatmatched = _resolve_stretch(self.state.track.bpm, inc.bpm)
+                n_bars = evt.n_bars if beatmatched else min(4, evt.n_bars)
+                if beatmatched and abs(ratio - 1.0) > 0.001:
+                    print(f"    Beatmatch: stretching {(ratio-1.0)*100:+.1f}%")
+                    inc_stretched = _time_stretch(inc_native, SR, ratio)
+                    stretched_downbeats = [d / ratio for d in inc.downbeats]
                 else:
-                    stretched_downbeats = list(evt.incoming_track.downbeats)
+                    ratio = 1.0
+                    inc_stretched = inc_native
+                    stretched_downbeats = list(inc.downbeats)
+                    if not beatmatched:
+                        print(f"    Tempos too far apart "
+                              f"({self.state.track.bpm:.0f}/{inc.bpm:.0f}) — cutting")
 
-                # Phase-align: find nearest downbeat to target cue_in
+                in_bar = (60.0 / inc.bpm) * 4
                 aligned_t = _find_nearest_downbeat(
-                    evt.cue_in.timestamp, stretched_downbeats
+                    evt.cue_in.timestamp / ratio, stretched_downbeats,
+                    max_offset=in_bar / 2.0
                 )
-                in_pos = int(aligned_t * SR)
-                in_audio = inc_audio
+                bar_frames = int((60.0 / self.state.track.bpm) * 4 * SR)
 
-                bar_frames  = int((60.0 / self.state.track.bpm) * 4 * SR)
-                xfade_total = bar_frames * evt.n_bars
-                xfade_done  = 0
+                # Defer the blend to the next outgoing downbeat for a beat-locked start
+                now_t  = pos / SR
+                future = [d for d in self.state.track.downbeats if d >= now_t]
+                start_frame = int((future[0] if future else now_t) * SR)
 
-                self.state.is_mixing   = True
-                self.state.next_track  = evt.incoming_track
+                pending = {
+                    "incoming":     inc,
+                    "in_stretched": inc_stretched,
+                    "in_native":    inc_native,
+                    "in_pos":       int(aligned_t * SR),
+                    "ratio":        ratio,
+                    "xfade_total":  max(1, bar_frames * n_bars),
+                    "start_frame":  start_frame,
+                }
+
+            # Activate the prepared transition once we reach the downbeat
+            if (pending is not None and not self.state.is_mixing
+                    and pos >= pending["start_frame"]):
+                in_audio        = pending["in_stretched"]
+                in_native       = pending["in_native"]
+                in_pos          = pending["in_pos"]
+                xfade_total     = pending["xfade_total"]
+                xfade_done      = 0
+                active_ratio    = pending["ratio"]
+                active_incoming = pending["incoming"]
+                self.state.is_mixing  = True
+                self.state.next_track = active_incoming
+                pending = None
 
             # Generate next chunk
             chunk_size = CHUNK_FRAMES
@@ -365,11 +396,10 @@ class StreamEngine:
                 actual  = min(out_end - pos, in_end - in_pos, chunk_size)
 
                 if actual <= 0:
-                    # Ran out — snap to incoming
-                    current_audio = in_audio
-                    pos = in_pos
-                    self._finish_transition(evt.incoming_track)
-                    in_audio = None
+                    # Ran out — hand off to incoming at native tempo
+                    current_audio, pos = self._handoff_native(
+                        in_native, in_pos, active_ratio, active_incoming)
+                    in_audio = in_native = None
                     self.state.is_mixing = False
                     continue
 
@@ -385,11 +415,10 @@ class StreamEngine:
                 self.state.mix_progress = phase
 
                 if xfade_done >= xfade_total:
-                    # Crossfade complete — hand off to incoming
-                    current_audio = in_audio
-                    pos = in_pos
-                    self._finish_transition(evt.incoming_track)
-                    in_audio = None
+                    # Crossfade complete — continue incoming at its native tempo
+                    current_audio, pos = self._handoff_native(
+                        in_native, in_pos, active_ratio, active_incoming)
+                    in_audio = in_native = None
                     self.state.is_mixing = False
             else:
                 # Normal playback
@@ -442,6 +471,16 @@ class StreamEngine:
                     filled = n_frames
         return out
 
+    def _handoff_native(self, in_native, in_pos, ratio, incoming):
+        """
+        After a crossfade completes, continue the incoming track at its own
+        native tempo (the crossfade region was stretched to the outgoing tempo).
+        Returns (current_audio, pos) for the producer to resume from.
+        """
+        self._finish_transition(incoming)
+        native_pos = int(round(in_pos * ratio))   # stretched frame → native frame
+        return in_native, native_pos
+
     def _finish_transition(self, incoming: TrackMeta):
         """Called when a crossfade completes."""
         self.state.track        = incoming
@@ -467,7 +506,7 @@ class StreamEngine:
         print(f"\n  ↩ Track ended, jumping to: {next_t.title}")
 
         self.state.track = next_t
-        self._current_audio, _ = _load_audio(next_t.file_path, SR)
+        self._current_audio = self._load_matched(next_t)
         self._recently_played.append(next_t.file_path)
         self.state.position = cue_in.timestamp if cue_in else 0.0
         self.state.tracks_played += 1

@@ -3,7 +3,7 @@ Data models for the Infinite DJ analysis pipeline.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 import json
 
 
@@ -70,6 +70,10 @@ class TrackMeta:
 
     # Meta
     analyzed_at: float        # unix timestamp of analysis
+
+    # Loudness — integrated level in dBFS (negative), used for gain-matching
+    # transitions. Optional so pre-migration rows still load.
+    loudness: Optional[float] = None
 
     def to_dict(self):
         return {

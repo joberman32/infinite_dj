@@ -24,6 +24,13 @@ SR          = 22050    # sample rate for analysis (mono, downsampled)
 HOP_LENGTH  = 512      # librosa default hop
 N_MELS      = 128
 
+# Tempo octave-normalization band. beat_track frequently locks to half- or
+# double-time; we fold the detected tempo into a single octave [MIN, 2*MIN)
+# so half/double errors resolve to a consistent representative tempo and the
+# beat grid is re-gridded to match (not just the BPM number relabeled).
+BPM_MIN     = 90.0
+BPM_MAX     = 180.0    # == 2 * BPM_MIN (one octave)
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -31,15 +38,73 @@ def _frames_to_times(frames, sr=SR, hop_length=HOP_LENGTH):
     return librosa.frames_to_time(frames, sr=sr, hop_length=hop_length).tolist()
 
 
+def _octave_normalize(bpm: float, beat_times: list) -> tuple[float, list]:
+    """
+    Fold a detected tempo into the [BPM_MIN, BPM_MAX) octave and re-grid the
+    beats to match. beat_track often locks to half- or double-time; relabeling
+    the BPM alone would leave the beat spacing wrong, so we actually insert
+    midpoint beats (when doubling) or drop every other beat (when halving).
+    """
+    beats = list(beat_times)
+
+    guard = 0
+    while bpm < BPM_MIN and guard < 4:
+        # Double: insert a beat halfway between each adjacent pair
+        doubled = []
+        for i in range(len(beats) - 1):
+            doubled.append(beats[i])
+            doubled.append((beats[i] + beats[i + 1]) / 2.0)
+        if beats:
+            doubled.append(beats[-1])
+        beats = doubled
+        bpm *= 2.0
+        guard += 1
+
+    while bpm >= BPM_MAX and guard < 8:
+        # Halve: keep every other beat
+        beats = beats[::2]
+        bpm /= 2.0
+        guard += 1
+
+    return bpm, beats
+
+
+def _anchor_downbeats(beat_times: list, onset_env: np.ndarray, sr: int, hop: int) -> list:
+    """
+    Pick the bar-phase (which of every 4 beats is beat 1) whose beats carry the
+    most onset energy, so downbeats land on the actual musical bar starts rather
+    than on an arbitrary offset. Returns every 4th beat from that phase.
+    """
+    if len(beat_times) < 4:
+        return list(beat_times)
+
+    frames = librosa.time_to_frames(np.asarray(beat_times), sr=sr, hop_length=hop)
+    frames = np.clip(frames, 0, len(onset_env) - 1)
+    strengths = onset_env[frames]
+
+    best_off, best_sum = 0, -np.inf
+    for off in range(4):
+        s = float(strengths[off::4].sum())
+        if s > best_sum:
+            best_sum, best_off = s, off
+
+    return list(np.asarray(beat_times)[best_off::4])
+
+
 def _compute_beats(y, sr):
     """
     Returns (bpm, bpm_confidence, beat_times, downbeat_times).
-    Downbeats are estimated by grouping beats into bars of 4 and
-    anchoring on the strongest onset in each group.
+
+    Tempo is octave-normalized into the house/techno band with the beat grid
+    re-gridded to match, then downbeats are anchored to the onset-strongest
+    bar phase.
     """
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP_LENGTH)
     bpm = float(tempo[0]) if hasattr(tempo, '__len__') else float(tempo)
     beat_times = _frames_to_times(beat_frames)
+
+    # Fold half/double-time detections into one octave, re-gridding beats
+    bpm, beat_times = _octave_normalize(bpm, beat_times)
 
     # Estimate confidence from beat consistency
     if len(beat_times) > 4:
@@ -49,8 +114,9 @@ def _compute_beats(y, sr):
     else:
         bpm_confidence = 0.0
 
-    # Group into bars of 4, take first beat of each group as downbeat
-    downbeats = beat_times[::4]
+    # Anchor downbeats to the strongest bar phase
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
+    downbeats = _anchor_downbeats(beat_times, onset_env, sr, HOP_LENGTH)
 
     return bpm, bpm_confidence, beat_times, list(downbeats)
 
@@ -160,6 +226,16 @@ def _compute_spectral_flatness(y, sr):
     return librosa.feature.spectral_flatness(y=y, hop_length=HOP_LENGTH)[0]
 
 
+def _compute_loudness(y) -> float:
+    """
+    Integrated loudness as full-signal RMS in dBFS (negative). Used to gain-match
+    tracks at transitions so levels don't jump. Relative, so the analysis-rate
+    mono signal is fine.
+    """
+    rms = float(np.sqrt(np.mean(np.square(y))))
+    return round(20.0 * np.log10(rms + 1e-9), 2)
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def analyze_track(file_path: str) -> TrackMeta:
@@ -202,6 +278,8 @@ def analyze_track(file_path: str) -> TrackMeta:
     sections = _compute_sections(y, sr, energy_curve, duration)
     print(f"{len(sections)} sections: {[s.label for s in sections]}")
 
+    loudness = _compute_loudness(y)
+
     print(f"  Cue points...", end=" ", flush=True)
     spectral_flatness = _compute_spectral_flatness(y, sr)
     cue_points = detect_cue_points(
@@ -236,4 +314,5 @@ def analyze_track(file_path: str) -> TrackMeta:
         sections=sections,
         cue_points=cue_points,
         analyzed_at=time.time(),
+        loudness=loudness,
     )

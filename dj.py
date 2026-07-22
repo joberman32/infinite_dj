@@ -28,7 +28,7 @@ from infinite_dj.mixer import (
     best_cue_out, best_cue_in,
 )
 from infinite_dj.engine import StreamEngine
-from infinite_dj.sequencer import sequence_energy_arc
+from infinite_dj.sequencer import sequence_energy_arc, sequence_greedy
 
 SUPPORTED_FORMATS = (".mp3", ".flac", ".wav", ".aiff", ".aif", ".ogg", ".m4a")
 
@@ -265,13 +265,15 @@ def cmd_mix(args):
         n_mix_bars=n_bars,
     )
 
-    bpm_ratio = track_a.bpm / track_b.bpm
     print(f"\nMix plan:")
     print(f"  OUT: {track_a.title} [{track_a.key}, {track_a.bpm:.1f} BPM]")
     print(f"       cue at {cue_out.timestamp:.1f}s (confidence {cue_out.confidence:.2f})")
     print(f"  IN:  {track_b.title} [{track_b.key}, {track_b.bpm:.1f} BPM]")
     print(f"       cue at {cue_in.timestamp:.1f}s (confidence {cue_in.confidence:.2f})")
-    print(f"  Stretch: {(bpm_ratio-1)*100:+.1f}%  |  Mix: {n_bars} bars\n")
+    if plan.beatmatched:
+        print(f"  Method: beatmatch ({(plan.stretch_ratio-1)*100:+.1f}% stretch)  |  Mix: {n_bars} bars\n")
+    else:
+        print(f"  Method: cut (tempos {track_a.bpm:.0f}/{track_b.bpm:.0f} too far to beatmatch)\n")
 
     result = render_transition(plan)
     write_mix(result, args.out)
@@ -306,11 +308,11 @@ def cmd_sequence(args):
 
 def cmd_render_set(args):
     """
-    Build a full mixed set: sequence all tracks and render
-    back-to-back transitions into a single audio file.
+    Build a full mixed set: sequence the tracks and render them onto one
+    continuous timeline (solo sections + overlapping beat-locked crossfades).
     """
-    import numpy as np
     import soundfile as sf
+    from infinite_dj.mixer import render_set
 
     db = TrackDB(args.db)
     tracks = db.load_all()
@@ -327,56 +329,20 @@ def cmd_render_set(args):
     seq = sequence_energy_arc(tracks, arc=arc, n_tracks=n)
     seq.describe()
 
-    print(f"\nRendering {len(seq.tracks) - 1} transitions...")
-    all_audio = []
-    SR = 44100
+    print(f"\nRendering continuous set ({len(seq.tracks)} tracks)...")
+    audio, sr, markers = render_set(seq.tracks, n_mix_bars=16)
 
-    for i in range(len(seq.tracks) - 1):
-        t_out = seq.tracks[i]
-        t_in  = seq.tracks[i + 1]
-
-        cue_out = best_cue_out(t_out)
-        cue_in  = best_cue_in(t_in)
-
-        if not cue_out or not cue_in:
-            print(f"  [{i+1}] Skipping {t_out.title} → {t_in.title} (no cue points)")
-            continue
-
-        print(f"\n  [{i+1}/{len(seq.tracks)-1}] {t_out.title} → {t_in.title}")
-        plan = TransitionPlan(
-            track_out=t_out,
-            track_in=t_in,
-            cue_out=cue_out,
-            cue_in=cue_in,
-            n_mix_bars=8,
-        )
-        try:
-            result = render_transition(plan)
-            all_audio.append(result.audio)
-        except Exception as e:
-            print(f"    ERROR: {e}")
-
-    if not all_audio:
-        print("No transitions rendered.")
-        return
-
-    # Concatenate with short silence between segments
-    silence = np.zeros((int(0.1 * SR), 2), dtype=np.float32)
-    combined = np.concatenate(
-        [chunk for seg in all_audio for chunk in [seg, silence]],
-        axis=0
-    )
-
-    # Final normalize
-    peak = np.abs(combined).max()
-    if peak > 0.0:
-        combined = combined * (0.93 / peak)
-
-    sf.write(args.out, combined, SR, subtype='PCM_24')
-    duration = len(combined) / SR
+    sf.write(args.out, audio, sr, subtype='PCM_24')
+    duration = len(audio) / sr
     mb = os.path.getsize(args.out) / 1024 / 1024
+
     print(f"\nSet rendered: {args.out}")
     print(f"  Duration: {duration/60:.1f} min | Size: {mb:.1f} MB")
+    print(f"\n  Transitions:")
+    for mk in markers:
+        m, s = divmod(mk.time, 60)
+        tag = f"{mk.method}" + (f" {mk.stretch_pct:+.1f}%" if mk.method == "beatmatch" else "")
+        print(f"    {int(m)}:{s:04.1f}  [{tag}]  {mk.label[:52]}")
 
 
 def cmd_play(args):
@@ -465,7 +431,7 @@ def main():
     p_mix.add_argument("track_a", help="Outgoing track (partial title or path)")
     p_mix.add_argument("track_b", help="Incoming track (partial title or path)")
     p_mix.add_argument("--out", required=True, help="Output WAV file path")
-    p_mix.add_argument("--bars", type=int, default=8, help="Mix region length in bars (default 8)")
+    p_mix.add_argument("--bars", type=int, default=16, help="Mix region length in bars (default 16)")
 
     # sequence
     p_seq = sub.add_parser("sequence", help="Print an optimized track sequence")

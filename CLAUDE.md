@@ -58,7 +58,9 @@ infinite_dj/
 
 ### Analysis pipeline (`analyzer.py`)
 - ~10-30s per track; results cached in SQLite by file hash
-- Extracts: BPM, Camelot key (Krumhansl-Schmuckler on chroma), beat/downbeat/phrase grid, 1s-resolution energy curve, structural sections, scored IN/OUT cue points at every downbeat
+- Extracts: BPM, Camelot key (Krumhansl-Schmuckler on chroma), beat/downbeat/phrase grid, 1s-resolution energy curve, structural sections, scored IN/OUT cue points at every downbeat, integrated loudness (RMS dBFS)
+- **BPM octave normalization**: `beat_track` often locks to half/double time; detected tempo is folded into the `[BPM_MIN, BPM_MAX)` octave (90–180) and the beat grid is re-gridded to match (midpoints inserted when doubling, decimated when halving) — not just the BPM number relabeled
+- **Downbeat anchoring**: bar-1 is the beat phase (of every 4) carrying the most onset energy, via `librosa.onset.onset_strength` — not a naive `beats[::4]`
 
 ### Cue point scoring (`cue_detector.py`)
 - Scans the full track (not just start/end windows) — any phrase boundary can be an entry or exit
@@ -67,11 +69,18 @@ infinite_dj/
 - `top_k = 5` cue points per type per track
 
 ### Mixing (`mixer.py`)
-- 3-phase EQ crossfade over N bars:
-  - Phase 1 (0–33%): outgoing full + incoming highs fade in
-  - Phase 2 (33–66%): bass swap — cut outgoing, bring incoming
-  - Phase 3 (66–100%): incoming full + outgoing highs fade out
-- BPM gaps resolved via Rubber Band time-stretching (clean up to ~12%)
+- Shared `_blend(out, in, phase)` primitive (used by both offline renderer and real-time engine):
+  - Highs/mids: equal-power crossfade across the whole region (never both tracks at full → no mud)
+  - Bass: single-source swap around the midpoint (only one kick plays at a time)
+- Loudness-matched: incoming track gain-adjusted toward the outgoing track's (offline set uses a fixed `MASTER_LOUDNESS` target)
+- **Stretch budget** (`MAX_STRETCH = 0.08`): `TransitionPlan.__post_init__` picks the least-stretch match (direct / half / double time). Within budget → beatmatch; beyond → a short 4-bar `cut` (no tempo mangling). `plan.beatmatched` / `plan.method` expose the decision.
+- Time-stretch via Rubber Band; a downbeat at native time `d` maps to `d / ratio` after stretching (ratio > 1 speeds up)
+- Default mix length: 16 bars
+
+### Full-set rendering (`render_set` in `mixer.py`)
+- Lays all tracks on ONE continuous timeline: each plays solo at its native tempo, consecutive tracks overlap only during a beat-locked crossfade, only the final track fades out. No silence gaps, no double-rendered tracks.
+- Per-transition tempo reference (the outgoing track's native tempo) — no global tempo lock/drift; only genuinely far-apart pairs become cuts.
+- Returns `(audio, sr, [SetMarker])`; `render-set` prints transition timestamps + method.
 
 ### Real-time engine (`engine.py`)
 Three threads:
@@ -105,6 +114,7 @@ Camelot wheel scoring used by both `compatible` command and sequencer:
 - Rhythm: `bpm`, `bpm_confidence`, `beats[]`, `downbeats[]`, `phrases[]`
 - Harmony: `key` (Camelot, e.g. "8B"), `key_name` (e.g. "C major"), `key_confidence`
 - Energy: `energy_curve[]` — normalized RMS per second
+- Loudness: `loudness` — integrated RMS in dBFS (negative); used for gain-matching transitions
 - Structure: `sections[]` (Section: start/end/label/energy), `cue_points[]` (CuePoint: timestamp/type/phrase_aligned/energy/confidence)
 
 ## Supported Audio Formats
