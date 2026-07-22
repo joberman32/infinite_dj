@@ -211,6 +211,38 @@ def _beatmatchable(a_bpm: float, b_bpm: float, max_stretch: float = 0.08) -> boo
     return min(abs(r - 1.0) for r in ratios) <= max_stretch
 
 
+def _percentile_ranker(values):
+    """
+    Return f(v) -> percentile of v within `values`, in [0, 1]. CLAP similarities
+    on a real library sit in a compressed band (e.g. 0.36–0.93, median ~0.77),
+    so a raw threshold barely discriminates; ranking against the library's own
+    distribution turns it into a usable per-library signal.
+    """
+    import bisect
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return lambda v: 0.5
+    m = len(vals)
+    return lambda v: 0.5 if v is None else bisect.bisect_right(vals, v) / m
+
+
+def library_sim_threshold(tracks: List[TrackMeta], pct: float = 85.0) -> Optional[float]:
+    """
+    A per-library "high textural similarity" cutoff: the given percentile of all
+    pairwise best-cue CLAP similarities. None if the library has no embeddings.
+    """
+    sims = []
+    for i, a in enumerate(tracks):
+        for b in tracks[i + 1:]:
+            c_out, c_in, _ = find_best_cue_pair(a, b)
+            s = cue_cosine_similarity(c_out, c_in)
+            if s is not None:
+                sims.append(s)
+    if not sims:
+        return None
+    return float(np.percentile(sims, pct))
+
+
 def sequence_for_mixing(
     tracks: List[TrackMeta],
     arc: str = "peak",
@@ -234,6 +266,13 @@ def sequence_for_mixing(
     n = n_tracks or len(tracks)
     graph = build_compatibility_graph(tracks)
     track_map = {t.file_path: t for t in tracks}
+
+    # Per-library CLAP ranker: turns the compressed similarity band into a
+    # discriminating [0,1] signal for timbral track selection (None if no
+    # embeddings, in which case CLAP simply doesn't contribute).
+    all_sims = [e.cue_similarity for edges in graph.values()
+                for e in edges if e.cue_similarity is not None]
+    clap_rank = _percentile_ranker(all_sims) if all_sims else None
 
     # Energy-arc target (same shapes as sequence_energy_arc)
     positions = np.linspace(0, 1, n)
@@ -271,10 +310,13 @@ def sequence_for_mixing(
 
         def score(e):
             t = track_map[e.track_b]
-            # Beatmatchability dominates so the render avoids cuts; harmony and
-            # energy-arc fit break ties.
+            # Beatmatchability dominates so the render avoids cuts; harmony,
+            # energy-arc fit, and timbral (CLAP) similarity break ties.
             bm = 1.0 if _beatmatchable(current.bpm, t.bpm, max_stretch) else 0.0
-            return 2.0 * bm + e.harmonic + 0.5 * energy_fit(t, pos)
+            s = 2.0 * bm + e.harmonic + 0.5 * energy_fit(t, pos)
+            if clap_rank is not None and e.cue_similarity is not None:
+                s += 0.75 * clap_rank(e.cue_similarity)
+            return s
 
         chosen = max(candidates, key=score)
         nxt = track_map[chosen.track_b]

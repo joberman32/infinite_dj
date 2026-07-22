@@ -4,6 +4,25 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-22 — CLAP validated and wired into set ordering
+
+- First real end-to-end run of CLAP (torch/transformers installed from the
+  optional extras) fixed three transformers-5.x breakages in `embeddings.py`
+  (`audios=`→`audio=`, output-object unwrap, tensor-truthiness). The feature
+  had never actually executed before this.
+- Found CLAP had ~no effect on rendered sets: `sequence_for_mixing` scored on
+  `e.harmonic`, not the CLAP-weighted `e.score`, so ordering ignored it; and
+  the fixed 0.82 style threshold sat at ~65th percentile of a real library.
+- Fix: CLAP now feeds set ordering via a **per-library percentile ranker**
+  (`_percentile_ranker`, weight 0.75 in `sequence_for_mixing.score`) so the
+  compressed 0.36–0.93 similarity band becomes a discriminating signal; the
+  blend style threshold is now the library's 85th percentile
+  (`library_sim_threshold`), passed through `render_set` →
+  `choose_transition_style(high_sim_threshold=...)`.
+- A/B (25-track Aphex+CC): mean consecutive-pair CLAP sim 0.749 → 0.785 (more
+  timbral continuity), −0.02 mean harmonic, +1 tempo cut. Still fully optional
+  and inert without embeddings.
+
 ## 2026-07-22 — 3-band breakpoint EQ crossfades
 
 - Replaced the mixer's fixed cos/sin bass-swap + high-crossfade with a 3-band

@@ -2,14 +2,18 @@
 
 We have integrated HuggingFace **CLAP** (`laion/clap-htsat-fused`) neural audio embeddings into `infinite_dj` for timbral, structural, and acoustic cue-point matching.
 
-> **Status (2026-07-22): code-complete but not yet validated end-to-end.**
-> The dependencies are optional (`pip install -r requirements-clap.txt`, ~2 GB)
-> and are not installed in the repo venv; no library database contains
-> embeddings yet. All code paths degrade gracefully to energy/harmony-based
-> matching when embeddings are absent (unit-tested with synthetic vectors).
-> The 0.82 blend-similarity threshold has not been tuned against real CLAP
-> output — validate by installing the extras, re-analyzing a library with
-> `--force`, and A/B-ing a rendered set before trusting it.
+> **Status (2026-07-22): validated end-to-end and wired into set ordering.**
+> Dependencies remain optional (`pip install -r requirements-clap.txt`, ~2 GB);
+> everything still falls back to energy/harmony matching when embeddings are
+> absent. First real run fixed three transformers-5.x breakages in
+> `embeddings.py`. CLAP now feeds `sequence_for_mixing` track ordering via a
+> **per-library percentile ranker** (weight 0.75) — the fixed 0.82 blend
+> threshold was ~65th percentile on a real library and didn't discriminate;
+> the style threshold is now the library's 85th percentile
+> (`library_sim_threshold`). Measured A/B on the 25-track Aphex+CC set: mean
+> consecutive-pair CLAP similarity 0.749 → 0.785 (more timbral continuity), at
+> a small cost of −0.02 mean harmonic and +1 tempo cut. Tunable via the 0.75
+> ordering weight and the percentile.
 
 ---
 

@@ -390,11 +390,17 @@ def _default_profile(style: TransitionStyle) -> TransitionProfile:
                          in_high_lead=style.in_high_delay)
 
 
-def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionStyle:
+def choose_transition_style(out_cue, in_cue, beatmatched: bool,
+                            high_sim_threshold: float = 0.82) -> TransitionStyle:
     """
     Pick a crossfade style from the energy and CLAP vector similarity of the
     outgoing exit and incoming entry. Beat-locked pairs get real blends shaped
     to their dynamics; tempo-incompatible pairs get a short cut.
+
+    `high_sim_threshold` is the CLAP-similarity cutoff above which a smooth long
+    blend is forced; callers pass a per-library calibrated value (the fixed
+    0.82 default is only a fallback — on a real library it fires on ~30% of
+    pairs and doesn't discriminate).
     """
     if not beatmatched:
         # Tempos clash — a long overlap would phase two grooves through each
@@ -418,7 +424,7 @@ def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionSty
                                   out_mid_hold, out_high_hold),
         )
 
-    if (sim is not None and sim >= 0.82) or (eo < 0.45 and ei < 0.45):
+    if (sim is not None and sim >= high_sim_threshold) or (eo < 0.45 and ei < 0.45):
         # High textural similarity or both sparse: long, symmetric smooth blend.
         return styled("blend", 16, cp=0.55, mid_lead=0.12, high_lead=0.12)
     if eo > 0.70 and ei > 0.70:
@@ -751,6 +757,14 @@ def render_set(
         a, _ = _load_audio(t.file_path, sr)
         return _loudness_match(a, t.loudness, MASTER_LOUDNESS)
 
+    # Calibrate the "high textural similarity → smooth blend" cutoff to this
+    # library's own CLAP distribution (None/fallback if no embeddings).
+    try:
+        from .sequencer import library_sim_threshold
+        sim_threshold = library_sim_threshold(tracks) or 0.82
+    except Exception:
+        sim_threshold = 0.82
+
     # Current track state, all in that track's own native timeline.
     cur_t     = tracks[0]
     cur_audio = load_matched(cur_t)
@@ -803,7 +817,8 @@ def render_set(
         in_sample = _time_to_samples(in_time, sr)
 
         # ── Pick a crossfade style from the two tracks' dynamics ───────────────
-        style = choose_transition_style(out_cue, in_cue, beatmatched)
+        style = choose_transition_style(out_cue, in_cue, beatmatched,
+                                        high_sim_threshold=sim_threshold)
 
         nxt_audio = load_matched(nxt_t)
         in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
