@@ -44,7 +44,9 @@ python dj.py --db custom.db <command>   # override default DB path (infinite_dj.
 | `mix <track_a> <track_b> --out file.wav [--bars N]` | Render a single transition |
 | `sequence [--start title] [--n N] [--arc peak\|steady\|build\|wave]` | Print a sequence plan |
 | `render-set --out file.wav [--n N] [--arc ...]` | Render a full set offline |
-| `splice --out file.wav [--length MIN] [--min-seg S] [--max-seg S] [--arc ...]` | Collage set: short segments of many tracks spliced at CLAP-chosen cut points |
+| `splice --out file.wav [--length MIN] [--min-seg S] [--max-seg S] [--layers N] [--arc ...]` | Collage set: sequential splices, or `--layers N` for a structured overlap-add collage (feature/weave/breathe) |
+| `render-set`/`splice --serve [--port N]` | Render then launch the interactive web player; `--timeline PATH` also writes the timeline JSON |
+| `serve --audio file.wav [--timeline JSON] [--port N]` | Launch the web player for an already-rendered set |
 | `play [--start title] [--arc ...] [--out file.wav] [--duration N]` | Real-time playback |
 
 Track arguments accept partial title matches or absolute file paths.

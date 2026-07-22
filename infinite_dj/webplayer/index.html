@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Infinite DJ — Player</title>
+  <link rel="stylesheet" href="/player.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">◉ INFINITE&nbsp;DJ</div>
+      <div id="clock"><span id="pos">0:00</span> / <span id="dur">0:00</span></div>
+    </header>
+
+    <main id="stage">
+      <!-- Now playing -->
+      <section id="nowcard" class="panel">
+        <div id="nowtint"></div>
+        <div class="now-inner">
+          <div id="now-mode" class="badge">—</div>
+          <div id="now-title" class="now-title">Loading…</div>
+          <div id="now-meta" class="now-meta"></div>
+          <div id="now-section" class="now-section"></div>
+          <div id="layers" class="layers"></div>
+        </div>
+        <div id="xfade" class="xfade hidden">
+          <svg viewBox="0 0 120 120" class="ring">
+            <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
+            <circle id="ring-fg" class="ring-fg" cx="60" cy="60" r="52"></circle>
+          </svg>
+          <div class="xfade-label"><span id="xfade-pct">0%</span><small id="xfade-mode"></small></div>
+        </div>
+      </section>
+
+      <!-- Camelot wheel + energy -->
+      <section id="side" class="panel">
+        <div class="side-title">Harmony</div>
+        <svg id="wheel" viewBox="-110 -110 220 220" aria-label="Camelot wheel"></svg>
+        <div class="energy">
+          <div class="energy-label">Energy</div>
+          <div class="energy-track"><div id="energy-fill"></div></div>
+        </div>
+        <div id="upnext" class="upnext"></div>
+      </section>
+    </main>
+
+    <!-- Mini arrangement timeline -->
+    <div id="timeline" class="panel">
+      <canvas id="tlcanvas"></canvas>
+    </div>
+
+    <!-- Transport -->
+    <footer id="transport">
+      <button id="playbtn" aria-label="Play/Pause">▶</button>
+      <div id="scrub" class="scrub"><div id="scrub-fill"></div><div id="scrub-head"></div></div>
+      <div id="ttime" class="ttime">0:00</div>
+    </footer>
+  </div>
+
+  <audio id="audio" src="/audio" preload="auto"></audio>
+  <script src="/player.js"></script>
+</body>
+</html>

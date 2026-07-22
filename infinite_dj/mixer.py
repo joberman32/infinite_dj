@@ -844,9 +844,13 @@ def render_set(
 
     master: list = []
     markers: list = []
+    clips: list = []          # per-track segments on the output timeline (for the UI)
     written = 0
+    cur_start = 0             # output sample where the current track became audible
+    prev_fade_in = 0.0        # fade-in of the current track (from the previous xfade)
 
     for i in range(len(tracks) - 1):
+        solo_start = written  # output sample where this track's solo begins
         nxt_t     = tracks[i + 1]
         out_bpm   = cur_t.bpm
         out_bar_sec = (60.0 / out_bpm) * 4
@@ -960,6 +964,20 @@ def render_set(
         else:
             written += len(solo)
 
+        # Record the outgoing track's clip: audible from cur_start through the end
+        # of this crossfade, fading out over the crossfade region.
+        xf_len = len(xf) if m > 0 else 0
+        clips.append({
+            "track": cur_t.file_path, "title": cur_t.title,
+            "out_start": round(cur_start / sr, 3),
+            "out_end": round((solo_start + len(solo) + xf_len) / sr, 3),
+            "fade_in": round(prev_fade_in, 3), "fade_out": round(xf_len / sr, 3),
+            "mode": style.name, "section": "",
+            "bpm": round(cur_t.bpm, 1), "key": cur_t.key,
+        })
+        cur_start = solo_start + len(solo)   # incoming enters at the crossfade start
+        prev_fade_in = xf_len / sr
+
         # ── Advance: incoming becomes current, continuing at its native tempo ──
         consumed_in = int(round(m * ratio))
         cur_t     = nxt_t
@@ -983,12 +1001,23 @@ def render_set(
     if len(tail) > 0:
         master.append(tail)
 
+    # Final (current) track's clip runs to the end of the output.
+    clips.append({
+        "track": cur_t.file_path, "title": cur_t.title,
+        "out_start": round(cur_start / sr, 3),
+        "out_end": round((written + len(tail)) / sr, 3),
+        "fade_in": round(prev_fade_in, 3),
+        "fade_out": round(min(2.0, len(tail) / sr), 3),
+        "mode": "end", "section": "",
+        "bpm": round(cur_t.bpm, 1), "key": cur_t.key,
+    })
+
     output = np.concatenate(master, axis=0)
     peak = np.abs(output).max()
     if peak > 0.95:
         output = output * (0.95 / peak)
 
-    return output, sr, markers
+    return output, sr, markers, clips
 
 
 def render_collage(
@@ -1060,7 +1089,7 @@ def render_collage(
     seg_pool = [(t, s) for t in tracks for s in _track_sections(t)]
     have_emb = any(s.embedding for _, s in seg_pool)
 
-    markers, pos, active, recent = [], 0, [], []
+    markers, clips, pos, active, recent = [], [], 0, [], []
 
     def prune():
         active[:] = [a for a in active if a[1] > pos]
@@ -1069,13 +1098,22 @@ def render_collage(
         """Overlap-add one segment at `pos`, log it, advance `pos` by hop_bars."""
         nonlocal pos
         seg = emit(t, section, seg_bars, fade_bars)
-        if seg is not None:
-            end = min(pos + len(seg), len(master))
+        end = min(pos + len(seg), len(master)) if seg is not None else pos
+        if seg is not None and end > pos:
             master[pos:end] += seg[:end - pos]
             markers.append(SetMarker(
                 time=pos / sr,
                 label=f"{t.title.split(' - ')[-1][:30]}  [{section.label} @{section.start:.0f}s]",
                 method=mode, stretch_pct=0.0, style=mode))
+            clips.append({
+                "track": t.file_path, "title": t.title,
+                "out_start": round(pos / sr, 3),
+                "out_end": round((pos + len(seg)) / sr, 3),
+                "fade_in": round(int(fade_bars) * bar, 3),
+                "fade_out": round(int(fade_bars) * bar, 3),
+                "mode": mode, "section": section.label,
+                "bpm": round(set_bpm, 1), "key": t.key,
+            })
             active.append((section.embedding, pos + len(seg)))
             recent.append(t.file_path)
         pos += max(bar_s, int(hop_bars) * bar_s)
@@ -1120,6 +1158,8 @@ def render_collage(
                 # Contiguous: hop ≈ segment length minus a short 2-bar join.
                 place(t, s, seg_bars, fade_bars=2, mode="feature",
                       hop_bars=max(1, seg_bars - 2))
+                if pos >= total_s:
+                    break
 
         elif mode == "weave":
             last_key = None
@@ -1151,7 +1191,7 @@ def render_collage(
     peak = np.abs(output).max()
     if peak > 0.95:
         output = output * (0.95 / peak)
-    return output, sr, markers
+    return output, sr, markers, clips
 
 
 # ── Auto-select best cue points ───────────────────────────────────────────────

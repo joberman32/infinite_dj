@@ -395,6 +395,44 @@ def cmd_sequence(args):
     seq.describe()
 
 
+def _serve(audio_path, timeline_path, port):
+    from infinite_dj.webserver import serve_player
+    httpd, url = serve_player(audio_path, timeline_path, port=port)
+    print(f"\n  ▶ Player running at {url}   (Ctrl+C to stop)")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Player stopped.")
+        httpd.shutdown()
+
+
+def _write_and_maybe_serve(args, tracks, clips, audio_path, duration, sr):
+    """Write the timeline JSON (if requested) and start the player (if --serve)."""
+    want_timeline = getattr(args, "timeline", None) or getattr(args, "serve", False)
+    if not want_timeline:
+        return
+    from infinite_dj.timeline import write_timeline
+    tl_path = getattr(args, "timeline", None) or \
+        (os.path.splitext(audio_path)[0] + ".timeline.json")
+    write_timeline(tl_path, clips, tracks, duration, sr)
+    print(f"  Timeline: {tl_path}")
+    if getattr(args, "serve", False):
+        _serve(audio_path, tl_path, getattr(args, "port", 8765))
+
+
+def cmd_serve(args):
+    """Serve the local web player for an already-rendered audio + timeline."""
+    if not os.path.isfile(args.audio):
+        print(f"Audio file not found: {args.audio}")
+        return
+    tl = args.timeline or (os.path.splitext(args.audio)[0] + ".timeline.json")
+    if not os.path.isfile(tl):
+        print(f"Timeline JSON not found: {tl}\n"
+              f"Render with --timeline/--serve first, or pass --timeline.")
+        return
+    _serve(args.audio, tl, args.port)
+
+
 def cmd_render_set(args):
     """
     Build a full mixed set: sequence the tracks and render them onto one
@@ -419,7 +457,7 @@ def cmd_render_set(args):
     seq.describe()
 
     print(f"\nRendering continuous set ({len(seq.tracks)} tracks)...")
-    audio, sr, markers = render_set(seq.tracks, n_mix_bars=16)
+    audio, sr, markers, clips = render_set(seq.tracks, n_mix_bars=16)
 
     # 16-bit PCM at the source sample rate — matches the library's fidelity
     # without the bloat of 24-bit.
@@ -435,6 +473,8 @@ def cmd_render_set(args):
         detail = (f"{mk.style} {mk.stretch_pct:+.1f}%"
                   if mk.method == "beatmatch" else f"cut ({mk.style})")
         print(f"    {int(m)}:{s:04.1f}  [{detail}]  {mk.label[:50]}")
+
+    _write_and_maybe_serve(args, tracks, clips, args.out, duration, sr)
 
 
 def cmd_splice(args):
@@ -460,7 +500,7 @@ def cmd_splice(args):
         # Structured, variable-pace overlap-add collage (feature / weave / breathe).
         print(f"Composing a {args.layers}-layer collage ({args.length:.0f} min, "
               f"{args.min_seg_bars}-{args.max_seg_bars} bar segments)...")
-        audio, sr, markers = render_collage(
+        audio, sr, markers, clips = render_collage(
             tracks, target_length_sec=target_sec, layers=args.layers,
             min_seg_bars=args.min_seg_bars, max_seg_bars=args.max_seg_bars,
             seed=args.seed)
@@ -477,7 +517,7 @@ def cmd_splice(args):
         seq = sequence_for_mixing(tracks, arc=args.arc, n_tracks=n_seg,
                                   allow_repeats=True, cooldown=cooldown)
         print(f"\nSplicing {len(seq.tracks)} segments...")
-        audio, sr, markers = render_set(
+        audio, sr, markers, clips = render_set(
             seq.tracks, min_seg_sec=min_seg, max_seg_sec=max_seg,
             target_length_sec=target_sec)
 
@@ -498,6 +538,8 @@ def cmd_splice(args):
         mode = (mk.method if args.layers > 1 else mk.style)
         name = mk.label.split(" → ")[0].split(" - ")[-1][:40]
         print(f"    {int(m)}:{s:04.1f}  (+{gap:4.0f}s)  [{mode:8}]  {name}")
+
+    _write_and_maybe_serve(args, tracks, clips, args.out, duration, sr)
 
 
 def cmd_play(args):
@@ -608,6 +650,10 @@ def main():
     p_set.add_argument("--n", type=int, help="Number of tracks")
     p_set.add_argument("--arc", default="peak",
                        choices=["peak", "steady", "build", "wave"])
+    p_set.add_argument("--timeline", help="Also write a timeline JSON for the web player")
+    p_set.add_argument("--serve", action="store_true",
+                       help="Launch the interactive web player after rendering")
+    p_set.add_argument("--port", type=int, default=8765, help="Player port (default 8765)")
 
     # splice
     p_splice = sub.add_parser("splice",
@@ -630,6 +676,16 @@ def main():
                           help="Collage: random seed for reproducible pacing")
     p_splice.add_argument("--arc", default="steady",
                           choices=["peak", "steady", "build", "wave"])
+    p_splice.add_argument("--timeline", help="Also write a timeline JSON for the web player")
+    p_splice.add_argument("--serve", action="store_true",
+                          help="Launch the interactive web player after rendering")
+    p_splice.add_argument("--port", type=int, default=8765, help="Player port (default 8765)")
+
+    # serve
+    p_serve = sub.add_parser("serve", help="Launch the web player for a rendered set")
+    p_serve.add_argument("--audio", required=True, help="Rendered audio file")
+    p_serve.add_argument("--timeline", help="Timeline JSON (defaults to <audio>.timeline.json)")
+    p_serve.add_argument("--port", type=int, default=8765, help="Player port (default 8765)")
 
     # play
     p_play = sub.add_parser("play", help="Start real-time infinite DJ engine")
@@ -653,6 +709,7 @@ def main():
         "sequence":   cmd_sequence,
         "render-set": cmd_render_set,
         "splice":     cmd_splice,
+        "serve":      cmd_serve,
         "play":       cmd_play,
     }
 

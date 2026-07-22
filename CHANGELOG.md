@@ -4,6 +4,30 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-22 — Interactive web player (MVP, phased)
+
+- Productization MVP: a dependency-free local web player that plays a rendered
+  set/collage and visualizes it live, synced to `audio.currentTime`.
+- `render_set`/`render_collage` now also return a **clips** list (per-track
+  segment on the output timeline: out_start/out_end, fade in/out, mode, section);
+  return arity changed to `(audio, sr, markers, clips)` — the two `dj.py` callers
+  updated. New `infinite_dj/timeline.py` (`build_timeline`/`write_timeline`)
+  joins clips with track metadata (title/bpm/camelot key/energy/colour) into a
+  compact JSON; embeddings never leak in.
+- `infinite_dj/webplayer/` (index.html, player.css, player.js): a vanilla-JS
+  dashboard — now-playing card (title/bpm/key/section/mode, per-track colour),
+  Camelot key wheel (SVG, highlights current + incoming), energy meter,
+  crossfade-progress ring, up-next countdown, a mini arrangement timeline with
+  playhead, and transport/seek. Theme-aware. It computes a `PlayerState(t)` from
+  the clips — the same shape the real-time engine can emit later (the phasing
+  hinge).
+- `infinite_dj/webserver.py`: tiny stdlib `http.server` with HTTP Range (audio
+  seeking). `dj.py serve` + `--serve`/`--timeline`/`--port` on the renderers.
+- Verified in-browser: loads, plays, syncs now-playing/Camelot/energy/up-next,
+  track flips at overlaps, no console errors. Fix: primary-clip selection
+  includes fade-in edges (t=0 no longer stuck on "Loading"). Tests: 23 pass
+  (+2 timeline).
+
 ## 2026-07-22 — Structured variable-pace collage (render_collage)
 
 - Replaced the fixed-cadence `render_layered` (a new track every ~9 s) with
