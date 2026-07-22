@@ -24,7 +24,6 @@ import os
 import sys
 import time
 import threading
-import collections
 import numpy as np
 import soundfile as sf
 import librosa
@@ -51,7 +50,8 @@ from .mixer import (
     _load_audio, _time_stretch, _apply_lowpass, _apply_highpass,
     _equal_power_fade, _apply_gain, _find_nearest_downbeat,
     _blend, _loudness_match, choose_transition_style,
-    TransitionPlan, MAX_STRETCH, MASTER_LOUDNESS, MIX_SR as SR
+    TransitionPlan, CrossfadeFilterState, MAX_STRETCH, MASTER_LOUDNESS,
+    MIX_SR as SR
 )
 from .sequencer import build_compatibility_graph, sequence_energy_arc
 from .harmony import camelot_compatibility, bpm_compatibility
@@ -62,7 +62,9 @@ from .harmony import camelot_compatibility, bpm_compatibility
 @dataclass
 class PlaybackState:
     track: Optional[TrackMeta] = None
-    position: float = 0.0          # seconds into current track
+    position: float = 0.0          # producer/render seconds into current track
+    playback_position: float = 0.0 # seconds emitted to the output device/session
+    underruns: int = 0
     is_mixing: bool = False
     mix_progress: float = 0.0      # 0-1 during an active crossfade
     next_track: Optional[TrackMeta] = None
@@ -82,6 +84,19 @@ class TransitionEvent:
     trigger_immediately: bool = False  # True = fire now regardless of position
 
 
+@dataclass
+class PreparedIncoming:
+    """Incoming audio prepared off the real-time producer path."""
+    current_path: str
+    incoming_track: TrackMeta
+    cue_in: CuePoint
+    native_audio: np.ndarray
+    stretched_audio: np.ndarray
+    stretched_start_frame: int
+    ratio: float
+    beatmatched: bool
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 CHUNK_FRAMES = 4096    # frames per producer iteration (~93ms at 44.1kHz)
@@ -96,6 +111,65 @@ def _fmt_time(seconds: float) -> str:
     m = int(seconds // 60)
     s = int(seconds % 60)
     return f"{m}:{s:02d}"
+
+
+def _audible_track_position(render_position: float, queued_frames: int) -> float:
+    """Convert the producer cursor to the listener's latency-compensated time."""
+    return max(0.0, render_position - queued_frames / SR)
+
+
+class AudioRingBuffer:
+    """Single-producer/single-consumer fixed-capacity stereo ring buffer.
+
+    The audio callback never allocates or waits for a mutex. CPython's GIL
+    makes the index updates atomic for this single producer/consumer use; the
+    producer is the only side that waits when the buffer is full.
+    """
+    def __init__(self, capacity_frames: int):
+        self.capacity = capacity_frames
+        self.data = np.zeros((capacity_frames, 2), dtype=np.float32)
+        self.read_frame = 0
+        self.write_frame = 0
+
+    @property
+    def available_frames(self) -> int:
+        return self.write_frame - self.read_frame
+
+    @property
+    def free_frames(self) -> int:
+        return self.capacity - self.available_frames
+
+    def write(self, chunk: np.ndarray) -> bool:
+        n = len(chunk)
+        if n > self.free_frames:
+            return False
+        start = self.write_frame % self.capacity
+        first = min(n, self.capacity - start)
+        self.data[start:start + first] = chunk[:first]
+        if first < n:
+            self.data[:n - first] = chunk[first:]
+        self.write_frame += n
+        return True
+
+    def read_into(self, out: np.ndarray, frames: int) -> int:
+        """Read into callback-owned output and return real (non-silent) frames."""
+        n = min(frames, self.available_frames)
+        if n:
+            start = self.read_frame % self.capacity
+            first = min(n, self.capacity - start)
+            out[:first] = self.data[start:start + first]
+            if first < n:
+                out[first:n] = self.data[:n - first]
+            self.read_frame += n
+        if n < frames:
+            out[n:frames].fill(0.0)
+        return n
+
+    def discard(self, frames: int) -> int:
+        """Advance the consumer without allocating an output buffer (headless)."""
+        n = min(frames, self.available_frames)
+        self.read_frame += n
+        return n
 
 
 def _pick_next_track(
@@ -144,12 +218,32 @@ def _resolve_stretch(out_bpm: float, in_bpm: float,
     return 1.0, False
 
 
+def _transition_start_time(
+    event: TransitionEvent,
+    current_track: TrackMeta,
+    producer_position: float,
+) -> float:
+    """Resolve a transition event to an outgoing-track timeline position.
+
+    Cue points produced by the scheduler are downbeats, so preserving their
+    timestamp keeps the audible handoff phrase-aligned.  The fallback paths
+    cover events without a cue (max-dwell) and explicit user skips.
+    """
+    if event.trigger_immediately:
+        return producer_position
+    if event.cue_out is not None and event.cue_out.timestamp >= producer_position:
+        return event.cue_out.timestamp
+    future = [d for d in current_track.downbeats if d >= producer_position]
+    return future[0] if future else producer_position
+
+
 def _build_crossfade_chunk(
     out_audio: np.ndarray,
     in_audio:  np.ndarray,
-    phase: float,         # 0.0 = start of crossfade, 1.0 = end
+    phase,                # scalar or per-sample values from 0.0 to 1.0
     sr: int = SR,
     style=None,
+    filter_state: Optional[CrossfadeFilterState] = None,
 ) -> np.ndarray:
     """
     Render one chunk of the crossfade using the shared, style-aware EQ blend
@@ -160,11 +254,17 @@ def _build_crossfade_chunk(
     if n == 0:
         return np.zeros((0, 2), dtype=np.float32)
     o, ii = out_audio[:n], in_audio[:n]
+    phase = np.asarray(phase, dtype=np.float32)
+    if phase.ndim == 0:
+        phase = np.full(n, float(phase), dtype=np.float32)
+    else:
+        phase = phase[:n]
+
     if style is not None and style.is_cut:
-        p = float(phase)
+        p = phase.reshape(-1, 1)
         fo, fi = np.cos(p * np.pi / 2), np.sin(p * np.pi / 2)
         return _apply_gain((o * fo + ii * fi).astype(np.float32), 0.9)
-    return _apply_gain(_blend(o, ii, float(phase), sr, style), 0.9)
+    return _apply_gain(_blend(o, ii, phase, sr, style, filter_state=filter_state), 0.9)
 
 
 # ── Stream Engine ─────────────────────────────────────────────────────────────
@@ -206,14 +306,20 @@ class StreamEngine:
         self.running    = False
         self._lock      = threading.Lock()
 
-        # Ring buffer: deque of (frames, 2) float32 chunks
-        self._buffer    = collections.deque()
-        self._buffer_frames = 0
-        self._buffer_lock = threading.Lock()
+        # Fixed, preallocated SPSC ring.  The callback reads from it without a
+        # mutex or temporary allocations; only the producer waits for capacity.
+        self._ring = AudioRingBuffer(BUFFER_FRAMES + CHUNK_FRAMES)
 
         # Transition queue: producer reads this
         self._transition_queue: Optional[TransitionEvent] = None
         self._transition_lock  = threading.Lock()
+
+        # Incoming tracks are decoded and stretched by a background worker,
+        # never by the producer thread that has to keep the audio buffer full.
+        self._prepare_lock = threading.Lock()
+        self._prepared_incoming: Optional[PreparedIncoming] = None
+        self._preparing_key: Optional[tuple] = None
+        self._preparation_thread = None
 
         # Recently played track paths (for cooldown)
         self._recently_played: List[str] = []
@@ -310,6 +416,84 @@ class StreamEngine:
         if self.on_track_change:
             self.on_track_change(t)
 
+    def _prepare_key(self, current: TrackMeta, incoming: TrackMeta,
+                     cue_in: CuePoint) -> tuple:
+        return (current.file_path, incoming.file_path, cue_in.timestamp)
+
+    def _request_incoming_prepare(self, current: TrackMeta, incoming: TrackMeta,
+                                  cue_in: Optional[CuePoint]):
+        """Begin decoding/stretching the selected next track in the background."""
+        if cue_in is None:
+            return
+        key = self._prepare_key(current, incoming, cue_in)
+        with self._prepare_lock:
+            if (self._prepared_incoming is not None
+                    and self._prepare_key(current, self._prepared_incoming.incoming_track,
+                                          self._prepared_incoming.cue_in) == key):
+                return
+            if self._preparing_key == key:
+                return
+            # Avoid competing full-track Rubber Band jobs. The scheduler normally
+            # chooses one next track per current track, so this is only relevant
+            # for an explicit skip while a stale preparation is still finishing.
+            if self._preparation_thread is not None and self._preparation_thread.is_alive():
+                return
+            self._preparing_key = key
+
+        def worker():
+            try:
+                native = self._load_matched(incoming)
+                ratio, beatmatched = _resolve_stretch(current.bpm, incoming.bpm)
+                if beatmatched and abs(ratio - 1.0) > 0.001:
+                    stretched = _time_stretch(native, SR, ratio)
+                    stretched_downbeats = [d / ratio for d in incoming.downbeats]
+                else:
+                    ratio = 1.0
+                    stretched = native
+                    stretched_downbeats = list(incoming.downbeats)
+
+                in_bar = (60.0 / incoming.bpm) * 4
+                aligned_t = _find_nearest_downbeat(
+                    cue_in.timestamp / ratio, stretched_downbeats,
+                    max_offset=in_bar / 2.0,
+                )
+                prepared = PreparedIncoming(
+                    current_path=current.file_path,
+                    incoming_track=incoming,
+                    cue_in=cue_in,
+                    native_audio=native,
+                    stretched_audio=stretched,
+                    stretched_start_frame=int(aligned_t * SR),
+                    ratio=ratio,
+                    beatmatched=beatmatched,
+                )
+                with self._prepare_lock:
+                    if self._preparing_key == key:
+                        self._prepared_incoming = prepared
+            except Exception as exc:
+                print(f"\n  [PREP ERROR] {incoming.title}: {exc}")
+            finally:
+                with self._prepare_lock:
+                    if self._preparing_key == key:
+                        self._preparing_key = None
+
+        self._preparation_thread = threading.Thread(
+            target=worker, name="infinite-dj-prep", daemon=True
+        )
+        self._preparation_thread.start()
+
+    def _prepared_for(self, current: TrackMeta, event: TransitionEvent) -> Optional[PreparedIncoming]:
+        """Return prepared audio only when it belongs to this exact handoff."""
+        with self._prepare_lock:
+            prepared = self._prepared_incoming
+            if prepared is None or event.cue_in is None:
+                return None
+            if (prepared.current_path == current.file_path
+                    and prepared.incoming_track.file_path == event.incoming_track.file_path
+                    and prepared.cue_in.timestamp == event.cue_in.timestamp):
+                return prepared
+        return None
+
     # ── Producer thread ───────────────────────────────────────────────────────
 
     def _producer(self):
@@ -328,6 +512,7 @@ class StreamEngine:
         active_ratio    = 1.0    # stretch applied to the incoming crossfade
         active_incoming = None
         active_style    = None   # TransitionStyle for the current crossfade
+        active_filters  = None   # persistent EQ state during a crossfade
         pending         = None   # transition prepared but not yet started
 
         while self.running:
@@ -337,53 +522,48 @@ class StreamEngine:
                 if evt:
                     self._transition_queue = None
 
-            # Prepare a newly-queued transition up front (load/stretch/align) so
-            # the actual start can be deferred to an outgoing downbeat.
+            # Turn a ready background preparation into a pending transition.  Do
+            # not decode or stretch here: blocking this thread risks draining the
+            # audio ring buffer and causing an underrun.
             if evt is not None and not self.state.is_mixing and pending is None:
-                inc = evt.incoming_track
-                print(f"\n  ⟶ Preparing transition to: {inc.title}")
-                inc_native = self._load_matched(inc)
-
-                ratio, beatmatched = _resolve_stretch(self.state.track.bpm, inc.bpm)
-                style = choose_transition_style(evt.cue_out, evt.cue_in, beatmatched)
-                if beatmatched and abs(ratio - 1.0) > 0.001:
-                    print(f"    Beatmatch [{style.name}]: stretching {(ratio-1.0)*100:+.1f}%")
-                    inc_stretched = _time_stretch(inc_native, SR, ratio)
-                    stretched_downbeats = [d / ratio for d in inc.downbeats]
+                prepared = self._prepared_for(self.state.track, evt)
+                if prepared is None:
+                    # Leave the event pending while normal playback continues.
+                    # The preloader was started when the scheduler selected this
+                    # track, and a late preparation safely falls back to a future
+                    # downbeat through _transition_start_time.
+                    self._request_incoming_prepare(
+                        self.state.track, evt.incoming_track, evt.cue_in
+                    )
+                    with self._transition_lock:
+                        if self._transition_queue is None:
+                            self._transition_queue = evt
                 else:
-                    ratio = 1.0
-                    inc_stretched = inc_native
-                    stretched_downbeats = list(inc.downbeats)
-                    if not beatmatched:
-                        print(f"    Tempos too far apart "
-                              f"({self.state.track.bpm:.0f}/{inc.bpm:.0f}) — cutting")
+                    inc = prepared.incoming_track
+                    style = choose_transition_style(
+                        evt.cue_out, evt.cue_in, prepared.beatmatched
+                    )
+                    if prepared.beatmatched and abs(prepared.ratio - 1.0) > 0.001:
+                        print(f"\n  ⟶ Transition [{style.name}] to: {inc.title} "
+                              f"({(prepared.ratio-1.0)*100:+.1f}% tempo)")
+                    elif not prepared.beatmatched:
+                        print(f"\n  ⟶ Transition [cut] to: {inc.title} (tempos too far apart)")
 
-                in_bar = (60.0 / inc.bpm) * 4
-                aligned_t = _find_nearest_downbeat(
-                    evt.cue_in.timestamp / ratio, stretched_downbeats,
-                    max_offset=in_bar / 2.0
-                )
-                bar_frames = int((60.0 / self.state.track.bpm) * 4 * SR)
-                if style.is_cut:
-                    xfade_total_frames = int(style.cut_seconds * SR)
-                else:
-                    xfade_total_frames = bar_frames * style.n_bars
-
-                # Defer the blend to the next outgoing downbeat for a beat-locked start
-                now_t  = pos / SR
-                future = [d for d in self.state.track.downbeats if d >= now_t]
-                start_frame = int((future[0] if future else now_t) * SR)
-
-                pending = {
-                    "incoming":     inc,
-                    "in_stretched": inc_stretched,
-                    "in_native":    inc_native,
-                    "in_pos":       int(aligned_t * SR),
-                    "ratio":        ratio,
-                    "style":        style,
-                    "xfade_total":  max(1, xfade_total_frames),
-                    "start_frame":  start_frame,
-                }
+                    bar_frames = int((60.0 / self.state.track.bpm) * 4 * SR)
+                    xfade_total_frames = (int(style.cut_seconds * SR) if style.is_cut
+                                          else bar_frames * style.n_bars)
+                    now_t = pos / SR
+                    start_t = _transition_start_time(evt, self.state.track, now_t)
+                    pending = {
+                        "incoming":     inc,
+                        "in_stretched": prepared.stretched_audio,
+                        "in_native":    prepared.native_audio,
+                        "in_pos":       prepared.stretched_start_frame,
+                        "ratio":        prepared.ratio,
+                        "style":        style,
+                        "xfade_total":  max(1, xfade_total_frames),
+                        "start_frame":  int(round(start_t * SR)),
+                    }
 
             # Activate the prepared transition once we reach the downbeat
             if (pending is not None and not self.state.is_mixing
@@ -396,6 +576,8 @@ class StreamEngine:
                 active_ratio    = pending["ratio"]
                 active_incoming = pending["incoming"]
                 active_style    = pending["style"]
+                active_filters  = (None if active_style.is_cut
+                                   else CrossfadeFilterState.create(SR))
                 self.state.is_mixing  = True
                 self.state.next_track = active_incoming
                 pending = None
@@ -419,9 +601,17 @@ class StreamEngine:
 
                 out_chunk = current_audio[pos:pos + actual]
                 in_chunk  = in_audio[in_pos:in_pos + actual]
-                phase = min(1.0, xfade_done / xfade_total)
+                # A per-sample phase ramp avoids the audible 93 ms gain steps
+                # caused by applying one scalar phase to the whole chunk.
+                phase = np.minimum(
+                    1.0,
+                    (xfade_done + np.arange(actual, dtype=np.float32))
+                    / max(1, xfade_total - 1),
+                )
 
-                chunk = _build_crossfade_chunk(out_chunk, in_chunk, phase, SR, active_style)
+                chunk = _build_crossfade_chunk(
+                    out_chunk, in_chunk, phase, SR, active_style, active_filters
+                )
                 xfade_done += actual
                 in_pos     += actual
                 pos        += actual
@@ -433,57 +623,47 @@ class StreamEngine:
                     current_audio, pos = self._handoff_native(
                         in_native, in_pos, active_ratio, active_incoming)
                     in_audio = in_native = None
+                    active_filters = None
                     self.state.is_mixing = False
             else:
                 # Normal playback
                 end = min(pos + chunk_size, len(current_audio))
                 if end <= pos:
                     # Track exhausted — wait for scheduler or pick next
-                    self._handle_track_end()
-                    current_audio = self._current_audio
-                    pos = 0
+                    current_audio, pos = self._handle_track_end()
                     continue
                 chunk = current_audio[pos:end]
                 pos = end
 
             # Update playback position
-            self.state.position     = pos / SR
-            self.state.total_played += len(chunk) / SR
+            self.state.position = pos / SR
 
             # Push to buffer
             self._push_buffer(chunk)
 
-            # Throttle if buffer is full
-            while self._buffer_frames > BUFFER_FRAMES and self.running:
+            # Throttle only on the producer side; the callback never blocks.
+            while self._ring.free_frames < CHUNK_FRAMES and self.running:
                 time.sleep(0.02)
 
     def _push_buffer(self, chunk: np.ndarray):
-        with self._buffer_lock:
-            self._buffer.append(chunk)
-            self._buffer_frames += len(chunk)
+        while not self._ring.write(chunk) and self.running:
+            time.sleep(0.002)
         if self.output_file is not None:
             self._output_chunks.append(chunk.copy())
 
     def _pop_buffer(self, n_frames: int) -> np.ndarray:
-        """Pull n_frames from the ring buffer for the audio callback."""
+        """Pull frames for non-real-time consumers such as headless output."""
         out = np.zeros((n_frames, 2), dtype=np.float32)
-        filled = 0
-        with self._buffer_lock:
-            while filled < n_frames and self._buffer:
-                chunk = self._buffer[0]
-                available = len(chunk)
-                need = n_frames - filled
-                if available <= need:
-                    out[filled:filled + available] = chunk
-                    filled += available
-                    self._buffer.popleft()
-                    self._buffer_frames -= available
-                else:
-                    out[filled:] = chunk[:need]
-                    self._buffer[0] = chunk[need:]
-                    self._buffer_frames -= need
-                    filled = n_frames
+        actual = self._ring.read_into(out, n_frames)
+        self._record_playback(actual, actual)
         return out
+
+    def _record_playback(self, requested_frames: int, actual_frames: int):
+        """Advance the audible/session clock from the consumer side only."""
+        self.state.playback_position += requested_frames / SR
+        self.state.total_played = self.state.playback_position
+        if actual_frames < requested_frames:
+            self.state.underruns += 1
 
     def _handoff_native(self, in_native, in_pos, ratio, incoming):
         """
@@ -507,7 +687,7 @@ class StreamEngine:
             self.on_track_change(incoming)
         print(f"\n  ✓ Now playing: {incoming.title} [{incoming.key}, {incoming.bpm:.0f} BPM]")
 
-    def _handle_track_end(self):
+    def _handle_track_end(self) -> tuple[np.ndarray, int]:
         """Track ran out with no scheduled transition. Pick next immediately."""
         current = self.state.track
         next_t = _pick_next_track(
@@ -519,11 +699,23 @@ class StreamEngine:
         cue_in = _pick_best_in_cue(next_t)
         print(f"\n  ↩ Track ended, jumping to: {next_t.title}")
 
-        self.state.track = next_t
+        event = TransitionEvent(next_t, cue_in) if cue_in else None
+        prepared = self._prepared_for(current, event) if event else None
+        if prepared is not None:
+            native_pos = int(round(prepared.stretched_start_frame * prepared.ratio))
+            self._current_audio = prepared.native_audio
+            self._finish_transition(next_t)
+            self.state.position = native_pos / SR
+            return self._current_audio, native_pos
+
+        # This should only occur when no candidate could be preloaded (for
+        # example, a preparation error). Keep the engine alive, but the normal
+        # scheduler path above never performs this I/O on the producer thread.
         self._current_audio = self._load_matched(next_t)
-        self._recently_played.append(next_t.file_path)
-        self.state.position = cue_in.timestamp if cue_in else 0.0
-        self.state.tracks_played += 1
+        entry_pos = int(round((cue_in.timestamp if cue_in else 0.0) * SR))
+        self._finish_transition(next_t)
+        self.state.position = entry_pos / SR
+        return self._current_audio, entry_pos
 
     # ── Scheduler thread ──────────────────────────────────────────────────────
 
@@ -546,7 +738,13 @@ class StreamEngine:
                 continue
 
             current   = self.state.track
-            pos       = self.state.position
+            # The producer intentionally runs ahead of the listener by the
+            # ring-buffer latency. Use audible time for dwell and cue policy;
+            # the producer still maps the chosen cue back to its render cursor
+            # when it writes the actual transition frames.
+            pos = _audible_track_position(
+                self.state.position, self._ring.available_frames
+            )
             bar_dur   = (60.0 / current.bpm) * 4
             bars_played = pos / bar_dur
 
@@ -560,6 +758,7 @@ class StreamEngine:
                     with self._lock:
                         self.state.next_track  = next_t
                         self.state.next_cue_in = cue_in
+                    self._request_incoming_prepare(current, next_t, cue_in)
                     print(f"\n  ⏭  Up next: {next_t.title} [{next_t.key}]")
 
             # 2. Check upcoming OUT cue points
@@ -616,8 +815,10 @@ class StreamEngine:
     # ── Audio output ──────────────────────────────────────────────────────────
 
     def _audio_callback(self, outdata, frames, time_info, status):
-        chunk = self._pop_buffer(frames)
-        outdata[:] = chunk
+        actual = self._ring.read_into(outdata, frames)
+        self._record_playback(frames, actual)
+        if status:
+            self.state.underruns += 1
 
     def _start_audio_stream(self):
         try:
@@ -639,7 +840,7 @@ class StreamEngine:
         while self.running:
             time.sleep(0.1)
             # Drain the buffer
-            while self._buffer_frames > 0:
+            while self._ring.available_frames > 0:
                 self._pop_buffer(CHUNK_FRAMES)
             if self.max_duration and self.state.total_played >= self.max_duration:
                 self.stop()
@@ -668,7 +869,7 @@ class StreamEngine:
 
         pos_str = _fmt_time(t.position)
         dur_str = _fmt_time(t.track.duration)
-        buf_s   = self._buffer_frames / SR
+        buf_s   = self._ring.available_frames / SR
 
         mixing_str = ""
         if t.is_mixing:
@@ -681,8 +882,8 @@ class StreamEngine:
 
         line = (
             f"\r  ▶ {t.track.title[:30]:<30}  "
-            f"{pos_str}/{dur_str}  "
-            f"buf={buf_s:.1f}s"
+            f"render={pos_str}/{dur_str}  "
+            f"played={_fmt_time(t.playback_position)}  buf={buf_s:.1f}s"
             f"{mixing_str}{next_str}  "
         )
         sys.stdout.write(line)

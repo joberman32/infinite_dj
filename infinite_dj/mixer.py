@@ -191,6 +191,66 @@ def _apply_gain(audio: np.ndarray, gain: float) -> np.ndarray:
     return (audio * gain).astype(np.float32)
 
 
+@dataclass
+class CrossfadeFilterState:
+    """Stateful low/high-pass filters for a chunked crossfade.
+
+    ``sosfilt`` resets to silence when called without ``zi``.  That is fine for
+    an offline region rendered in one call, but produces a filter transient at
+    every producer chunk in the real-time engine.  This object keeps one state
+    per source/band/channel for the lifetime of a live transition.
+    """
+    low_sos: np.ndarray
+    high_sos: np.ndarray
+    out_low_zi: np.ndarray
+    out_high_zi: np.ndarray
+    in_low_zi: np.ndarray
+    in_high_zi: np.ndarray
+
+    @classmethod
+    def create(cls, sr: int = MIX_SR, cutoff: float = 200.0):
+        from scipy.signal import butter
+        low_sos = butter(4, cutoff / (sr / 2), btype="low", output="sos")
+        high_sos = butter(4, cutoff / (sr / 2), btype="high", output="sos")
+        # Shape is (sections, delay-elements, stereo-channels), matching the
+        # per-channel state maintained in ``_filter`` below.
+        state_shape = (low_sos.shape[0], 2, 2)
+        return cls(
+            low_sos=low_sos,
+            high_sos=high_sos,
+            out_low_zi=np.zeros(state_shape, dtype=np.float64),
+            out_high_zi=np.zeros((high_sos.shape[0], 2, 2), dtype=np.float64),
+            in_low_zi=np.zeros(state_shape, dtype=np.float64),
+            in_high_zi=np.zeros((high_sos.shape[0], 2, 2), dtype=np.float64),
+        )
+
+    @staticmethod
+    def _filter(audio: np.ndarray, sos: np.ndarray, zi: np.ndarray) -> tuple:
+        from scipy.signal import sosfilt
+        filtered = np.empty_like(audio, dtype=np.float32)
+        next_zi = np.empty_like(zi)
+        for channel in range(2):
+            filtered[:, channel], next_zi[:, :, channel] = sosfilt(
+                sos, audio[:, channel], zi=zi[:, :, channel]
+            )
+        return filtered, next_zi
+
+    def split(self, out_audio: np.ndarray, in_audio: np.ndarray) -> tuple:
+        out_bass, self.out_low_zi = self._filter(
+            out_audio, self.low_sos, self.out_low_zi
+        )
+        out_high, self.out_high_zi = self._filter(
+            out_audio, self.high_sos, self.out_high_zi
+        )
+        in_bass, self.in_low_zi = self._filter(
+            in_audio, self.low_sos, self.in_low_zi
+        )
+        in_high, self.in_high_zi = self._filter(
+            in_audio, self.high_sos, self.in_high_zi
+        )
+        return out_bass, out_high, in_bass, in_high
+
+
 # ── Crossfade shapes ──────────────────────────────────────────────────────────
 
 def _equal_power_fade(n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -283,6 +343,7 @@ def _blend(
     sr: int = MIX_SR,
     style: Optional[TransitionStyle] = None,
     bass_cutoff: float = 200.0,
+    filter_state: Optional[CrossfadeFilterState] = None,
 ) -> np.ndarray:
     """
     Shared DJ-style EQ blend used by both the offline renderer and the real-time
@@ -308,10 +369,13 @@ def _blend(
         phase = np.full(n, float(phase), dtype=np.float32)
     phase = phase[:n].reshape(-1, 1)
 
-    out_bass = _apply_lowpass(out_c, sr, bass_cutoff)
-    out_high = _apply_highpass(out_c, sr, bass_cutoff)
-    in_bass  = _apply_lowpass(in_c, sr, bass_cutoff)
-    in_high  = _apply_highpass(in_c, sr, bass_cutoff)
+    if filter_state is None:
+        out_bass = _apply_lowpass(out_c, sr, bass_cutoff)
+        out_high = _apply_highpass(out_c, sr, bass_cutoff)
+        in_bass  = _apply_lowpass(in_c, sr, bass_cutoff)
+        in_high  = _apply_highpass(in_c, sr, bass_cutoff)
+    else:
+        out_bass, out_high, in_bass, in_high = filter_state.split(out_c, in_c)
 
     # Outgoing highs fade out across the region; incoming highs enter after a
     # delay and rise with a shaped slope (higher slope = later/steeper).
