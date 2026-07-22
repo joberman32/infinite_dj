@@ -15,6 +15,7 @@ class CuePoint:
     phrase_aligned: bool      # whether this lands on a phrase boundary
     energy: float             # normalized RMS energy at this point (0-1)
     confidence: float         # composite score from cue detector (0-1)
+    embedding: Optional[List[float]] = None  # 512D CLAP feature vector
 
     def to_dict(self):
         return self.__dict__
@@ -22,6 +23,7 @@ class CuePoint:
     @classmethod
     def from_dict(cls, d):
         return cls(**d)
+
 
 
 @dataclass

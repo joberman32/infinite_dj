@@ -1,0 +1,6 @@
+# Optional: CLAP neural audio embeddings for cue-point pairing.
+# Heavy (~2 GB with torch). Without these installed, everything works and the
+# sequencer/mixer fall back to energy/harmony-based cue matching.
+#   pip install -r requirements-clap.txt
+torch>=2.0.0
+transformers>=4.30.0

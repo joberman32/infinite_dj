@@ -307,17 +307,28 @@ class TransitionStyle:
 
 def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionStyle:
     """
-    Pick a crossfade style from the energy of the outgoing exit and incoming
-    entry. Beat-locked pairs get real blends shaped to their dynamics; tempo-
-    incompatible pairs get a short cut so two unsynced grooves never smear.
+    Pick a crossfade style from the energy and CLAP vector similarity of the
+    outgoing exit and incoming entry. Beat-locked pairs get real blends shaped
+    to their dynamics; tempo-incompatible pairs get a short cut.
     """
     if not beatmatched:
         # Tempos clash — a long overlap would phase two grooves through each
         # other. Keep it near-instant (just enough to avoid a click).
         return TransitionStyle("cut", n_bars=0, is_cut=True, cut_seconds=0.30)
 
+    try:
+        from .sequencer import cue_cosine_similarity
+        sim = cue_cosine_similarity(out_cue, in_cue)
+    except Exception:
+        sim = None
+
     eo = out_cue.energy if out_cue else 0.5
     ei = in_cue.energy if in_cue else 0.5
+
+    if sim is not None and sim >= 0.82:
+        # High CLAP textural similarity: smooth 16-bar blend
+        return TransitionStyle("blend", 16, high_slope=1.0, in_high_delay=0.10,
+                               bass_swap_center=0.55, bass_swap_width=0.30)
 
     if eo < 0.45 and ei < 0.45:
         # Both sparse (breakdown/outro → intro): room for a long smooth blend
@@ -334,6 +345,7 @@ def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionSty
     # Exiting a calm part into a rising one: bring the incoming up sooner
     return TransitionStyle("build", 8, high_slope=0.8, in_high_delay=0.10,
                            bass_swap_center=0.40, bass_swap_width=0.15)
+
 
 
 def _blend(

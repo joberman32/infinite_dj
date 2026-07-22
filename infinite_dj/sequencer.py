@@ -13,8 +13,59 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 import numpy as np
 
-from .models import TrackMeta
+from .models import TrackMeta, CuePoint
 from .harmony import camelot_compatibility, bpm_compatibility
+
+
+def cue_cosine_similarity(c1: CuePoint, c2: CuePoint) -> Optional[float]:
+    """Compute cosine similarity between two CuePoint embedding vectors."""
+    if not c1 or not c2 or not c1.embedding or not c2.embedding:
+        return None
+    v1 = np.array(c1.embedding, dtype=np.float32)
+    v2 = np.array(c2.embedding, dtype=np.float32)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return None
+    sim = float(np.dot(v1, v2) / (norm1 * norm2))
+    return round(float(np.clip(sim, -1.0, 1.0)), 4)
+
+
+def find_best_cue_pair(
+    track_out: TrackMeta,
+    track_in: TrackMeta
+) -> tuple[Optional[CuePoint], Optional[CuePoint], float]:
+    """
+    Find the optimal (cue_out, cue_in) pair between two tracks.
+    Uses CLAP vector similarity if available, combined with phrase alignment & confidence.
+    Returns (cue_out, cue_in, match_score).
+    """
+    outs = [c for c in track_out.cue_points if c.type == "out"]
+    ins  = [c for c in track_in.cue_points if c.type == "in"]
+
+    if not outs or not ins:
+        c_out = outs[0] if outs else (track_out.cue_points[0] if track_out.cue_points else None)
+        c_in  = ins[0]  if ins  else (track_in.cue_points[0]  if track_in.cue_points  else None)
+        return c_out, c_in, 0.5
+
+    best_pair = (outs[0], ins[0])
+    best_score = -1.0
+
+    for c_out in outs:
+        for c_in in ins:
+            sim = cue_cosine_similarity(c_out, c_in)
+            if sim is not None:
+                phrase_bonus = 0.2 if (c_out.phrase_aligned and c_in.phrase_aligned) else 0.0
+                score = 0.6 * sim + 0.2 * (c_out.confidence + c_in.confidence) / 2.0 + phrase_bonus
+            else:
+                phrase_bonus = 0.3 if (c_out.phrase_aligned and c_in.phrase_aligned) else 0.0
+                score = 0.7 * (c_out.confidence + c_in.confidence) / 2.0 + phrase_bonus
+
+            if score > best_score:
+                best_score = score
+                best_pair = (c_out, c_in)
+
+    return best_pair[0], best_pair[1], round(best_score, 3)
 
 
 @dataclass
@@ -24,6 +75,7 @@ class CompatibilityEdge:
     harmonic: float
     rhythmic: float
     score: float   # weighted composite
+    cue_similarity: Optional[float] = None
 
 
 @dataclass
@@ -39,7 +91,8 @@ class Sequence:
             dur = f"{int(t.duration//60)}:{int(t.duration%60):02d}"
             if i < len(self.edges):
                 e = self.edges[i]
-                arrow = f"→ harm={e.harmonic:.2f} rhythm={e.rhythmic:.2f} score={e.score:.2f}"
+                sim_str = f" clap={e.cue_similarity:.2f}" if e.cue_similarity is not None else ""
+                arrow = f"→ harm={e.harmonic:.2f} rhythm={e.rhythmic:.2f}{sim_str} score={e.score:.2f}"
             else:
                 arrow = "(end)"
             print(f"  {i+1:>2}. [{t.key} {t.bpm:.0f}bpm {dur}] {t.title[:40]}")
@@ -64,7 +117,14 @@ def build_compatibility_graph(
                 continue
             harm   = camelot_compatibility(a.key, b.key)
             rhythm = bpm_compatibility(a.bpm, b.bpm)
-            score  = harm_weight * harm + rhythm_weight * rhythm
+
+            c_out, c_in, _ = find_best_cue_pair(a, b)
+            sim = cue_cosine_similarity(c_out, c_in) if (c_out and c_in) else None
+
+            if sim is not None:
+                score = 0.4 * harm + 0.3 * rhythm + 0.3 * max(0.0, sim)
+            else:
+                score = harm_weight * harm + rhythm_weight * rhythm
 
             graph[a.file_path].append(CompatibilityEdge(
                 track_a=a.file_path,
@@ -72,12 +132,14 @@ def build_compatibility_graph(
                 harmonic=round(harm, 3),
                 rhythmic=round(rhythm, 3),
                 score=round(score, 3),
+                cue_similarity=sim,
             ))
 
         # Sort edges by score descending
         graph[a.file_path].sort(key=lambda e: -e.score)
 
     return graph
+
 
 
 def sequence_greedy(

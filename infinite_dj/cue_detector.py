@@ -11,8 +11,9 @@ phrase boundaries and energy valleys regardless of track position.
 """
 
 import numpy as np
-from typing import List
+from typing import List, Optional
 from .models import CuePoint
+
 
 
 def _energy_at(timestamp: float, energy_curve: List[float]) -> float:
@@ -159,10 +160,12 @@ def detect_cue_points(
     duration: float,
     top_k: int = 5,
     mid_track: bool = True,    # Phase 3 default: scan full track
+    y: Optional[np.ndarray] = None,  # Audio waveform for CLAP embedding extraction
 ) -> List[CuePoint]:
     """
     Score all downbeats as potential IN/OUT cue points.
     Returns top_k of each type, sorted by timestamp.
+    Extracted cue points include CLAP embeddings if audio `y` is provided.
     """
     cue_points = []
 
@@ -201,5 +204,16 @@ def detect_cue_points(
     ins  = sorted([c for c in cue_points if c.type == "in"],
                   key=lambda c: c.confidence, reverse=True)[:top_k]
 
-    return sorted(outs + ins, key=lambda c: c.timestamp)
+    final_cues = sorted(outs + ins, key=lambda c: c.timestamp)
+
+    if y is not None:
+        try:
+            from .embeddings import get_cue_embedding
+            for c in final_cues:
+                c.embedding = get_cue_embedding(y, sr, c.timestamp, c.type)
+        except Exception:
+            pass
+
+    return final_cues
+
 
