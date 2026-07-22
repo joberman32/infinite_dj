@@ -979,7 +979,7 @@ def render_layered(
     total_s = _time_to_samples(target_length_sec, sr)
     master  = np.zeros((total_s + layer_s + sr, 2), dtype=np.float32)
 
-    def prep(t):
+    def prep(t, occurrence):
         audio, _ = _load_audio(t.file_path, sr)
         audio = _loudness_match(audio, t.loudness, MASTER_LOUDNESS)
         # Lock to the set tempo (nearest of direct / half / double time).
@@ -988,8 +988,12 @@ def render_layered(
         if abs(ratio - 1.0) > 0.001:
             audio = _time_stretch(audio, sr, ratio)
         downs = [d / ratio for d in t.downbeats]
-        ci = _set_entry_cue(t)
-        et = (ci.timestamp / ratio) if ci else (downs[0] if downs else 0.0)
+        # Each occurrence of a track enters at a DIFFERENT cue point (spread
+        # across the track), so a repeated track contributes a different splice
+        # rather than the identical segment every time.
+        entries = sorted({c.timestamp for c in t.cue_points}) or \
+            ([t.downbeats[0]] if t.downbeats else [0.0])
+        et = entries[occurrence % len(entries)] / ratio
         et = _find_nearest_downbeat(et, downs, max_offset=(60.0 / set_bpm) * 4 / 2.0)
         seg = audio[_time_to_samples(et, sr): _time_to_samples(et, sr) + layer_s]
         if len(seg) < bar_s:
@@ -1001,14 +1005,17 @@ def render_layered(
         env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
         return (seg * env.reshape(-1, 1)).astype(np.float32), ratio
 
-    pos, idx, markers = 0, 0, []
+    pos, idx, markers, seen = 0, 0, [], {}
     while pos < total_s and idx < len(tracks):
-        seg, ratio = prep(tracks[idx])
+        t = tracks[idx]
+        k = seen.get(t.file_path, 0)
+        seen[t.file_path] = k + 1
+        seg, ratio = prep(t, k)
         if seg is not None:
             end = min(pos + len(seg), len(master))
             master[pos:end] += seg[:end - pos]
             markers.append(SetMarker(
-                time=pos / sr, label=tracks[idx].title, method="layer",
+                time=pos / sr, label=f"{t.title}  [splice {k+1}]", method="layer",
                 stretch_pct=(ratio - 1.0) * 100.0, style=f"layer@{set_bpm:.0f}bpm"))
         pos += hop_s
         idx += 1
