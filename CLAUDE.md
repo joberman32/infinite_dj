@@ -79,7 +79,8 @@ infinite_dj/
 - `top_k = 5` cue points per type per track
 
 ### Mixing (`mixer.py`)
-- **Adaptive crossfade styles** (`TransitionStyle` / `choose_transition_style`): the crossfade's length, high-frequency slope + delay, and bass-swap timing are chosen from the energy at the exit and entry cues:
+- **3-band breakpoint EQ** (`_split3` / `CrossfadeFilterState` / `TransitionProfile`): each track is split into low/mid/high by difference-of-lowpass (perfect reconstruction) — a DJ-mixer EQ. A crossfade is described by per-track **automation lanes** (piecewise-linear `(phase, value)` breakpoints) for volume + each band, built by `_make_profile`. Bass swaps single-source; mid and high crossfade with independent timing (e.g. a `swap` brings the incoming hats in early but holds its mids back). Stateful (`CrossfadeFilterState`) so real-time chunked rendering matches offline sample-for-sample. Idea from Vande Veire & De Bie (AGPL) — reimplemented.
+- **Adaptive crossfade styles** (`TransitionStyle` / `choose_transition_style`): the crossfade's length and per-band automation are chosen from the energy at the exit and entry cues:
   - `blend` (breakdown→intro, both sparse): long 16-bar smooth blend
   - `swap` (drop→drop, both busy): short 8-bar, incoming highs held back, quick bass swap
   - `fade` (busy→calm): medium 12-bar gentle

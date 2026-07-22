@@ -4,6 +4,25 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-22 — 3-band breakpoint EQ crossfades
+
+- Replaced the mixer's fixed cos/sin bass-swap + high-crossfade with a 3-band
+  DJ-mixer EQ (low/mid/high) driven by per-track breakpoint automation lanes
+  (`TransitionProfile`, `_make_profile`, `_split3`). Bands are built by
+  difference-of-lowpass for exact reconstruction; mid and high crossfade with
+  independent timing so, e.g., a drop→drop `swap` brings the incoming hats in
+  early while holding its mids back. Idea from Vande Veire & De Bie's auto-DJ
+  (AGPL) — reimplemented, not copied.
+- `CrossfadeFilterState` now carries two lowpass states (200 Hz, 2600 Hz) per
+  source. **Invariant preserved**: stateful chunked rendering must equal a
+  single continuous render sample-for-sample (test
+  `test_stateful_chunked_blend_matches_continuous_rendering`). If you touch the
+  band split, keep low+mid+high == input and keep the offline `_split3` and the
+  stateful `.split()` identical.
+- Legacy `TransitionStyle` scalar knobs are retained; `_default_profile` builds
+  a profile from them when `style.profile` is None (back-compat for the tests
+  and any direct `TransitionStyle(...)` construction).
+
 ## 2026-07-21 — Multi-Core Parallel Library Analysis
 
 - Upgraded `dj.py analyze` command to use Python's `concurrent.futures.ProcessPoolExecutor` for multi-core parallel processing (`dj.py`, `analyzer.py`).

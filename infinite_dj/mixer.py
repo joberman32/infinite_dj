@@ -169,6 +169,13 @@ def _find_nearest_downbeat(
 
 # ── Multiband EQ helpers ──────────────────────────────────────────────────────
 
+# Three-band split points, modelling a DJ mixer's low/mid/high EQ. The bands are
+# built by difference-of-lowpass so low+mid+high == the original signal exactly
+# (no gain hole when all three are at unity).
+LOW_CUT = 200.0     # bass / low-mid boundary
+MID_CUT = 2600.0    # mid / treble boundary
+
+
 def _apply_lowpass(audio: np.ndarray, sr: int, cutoff: float = 200.0) -> np.ndarray:
     """Extract bass content (below cutoff Hz)."""
     from scipy.signal import butter, sosfilt
@@ -191,37 +198,51 @@ def _apply_gain(audio: np.ndarray, gain: float) -> np.ndarray:
     return (audio * gain).astype(np.float32)
 
 
+def _split3(audio: np.ndarray, sr: int) -> tuple:
+    """
+    Split into (low, mid, high) bands by difference-of-lowpass so the three sum
+    back to the input exactly. Used for offline (whole-region) rendering.
+    """
+    lp_low = _apply_lowpass(audio, sr, LOW_CUT)
+    lp_mid = _apply_lowpass(audio, sr, MID_CUT)
+    low  = lp_low
+    mid  = lp_mid - lp_low
+    high = audio[:len(lp_mid)] - lp_mid
+    return low, mid, high
+
+
 @dataclass
 class CrossfadeFilterState:
-    """Stateful low/high-pass filters for a chunked crossfade.
+    """Stateful 3-band split for a chunked crossfade.
 
     ``sosfilt`` resets to silence when called without ``zi``.  That is fine for
     an offline region rendered in one call, but produces a filter transient at
-    every producer chunk in the real-time engine.  This object keeps one state
-    per source/band/channel for the lifetime of a live transition.
+    every producer chunk in the real-time engine.  This object keeps the two
+    lowpass states (per source/channel) for the lifetime of a live transition,
+    so chunked rendering matches a single continuous render sample-for-sample.
+    Bands are reconstructed as low = lp(LOW), mid = lp(MID) - lp(LOW),
+    high = x - lp(MID).
     """
     low_sos: np.ndarray
-    high_sos: np.ndarray
+    mid_sos: np.ndarray
     out_low_zi: np.ndarray
-    out_high_zi: np.ndarray
+    out_mid_zi: np.ndarray
     in_low_zi: np.ndarray
-    in_high_zi: np.ndarray
+    in_mid_zi: np.ndarray
 
     @classmethod
-    def create(cls, sr: int = MIX_SR, cutoff: float = 200.0):
+    def create(cls, sr: int = MIX_SR):
         from scipy.signal import butter
-        low_sos = butter(4, cutoff / (sr / 2), btype="low", output="sos")
-        high_sos = butter(4, cutoff / (sr / 2), btype="high", output="sos")
-        # Shape is (sections, delay-elements, stereo-channels), matching the
-        # per-channel state maintained in ``_filter`` below.
-        state_shape = (low_sos.shape[0], 2, 2)
+        low_sos = butter(4, LOW_CUT / (sr / 2), btype="low", output="sos")
+        mid_sos = butter(4, MID_CUT / (sr / 2), btype="low", output="sos")
+        low_shape = (low_sos.shape[0], 2, 2)   # (sections, delay-elems, channels)
+        mid_shape = (mid_sos.shape[0], 2, 2)
         return cls(
-            low_sos=low_sos,
-            high_sos=high_sos,
-            out_low_zi=np.zeros(state_shape, dtype=np.float64),
-            out_high_zi=np.zeros((high_sos.shape[0], 2, 2), dtype=np.float64),
-            in_low_zi=np.zeros(state_shape, dtype=np.float64),
-            in_high_zi=np.zeros((high_sos.shape[0], 2, 2), dtype=np.float64),
+            low_sos=low_sos, mid_sos=mid_sos,
+            out_low_zi=np.zeros(low_shape, dtype=np.float64),
+            out_mid_zi=np.zeros(mid_shape, dtype=np.float64),
+            in_low_zi=np.zeros(low_shape, dtype=np.float64),
+            in_mid_zi=np.zeros(mid_shape, dtype=np.float64),
         )
 
     @staticmethod
@@ -236,19 +257,13 @@ class CrossfadeFilterState:
         return filtered, next_zi
 
     def split(self, out_audio: np.ndarray, in_audio: np.ndarray) -> tuple:
-        out_bass, self.out_low_zi = self._filter(
-            out_audio, self.low_sos, self.out_low_zi
-        )
-        out_high, self.out_high_zi = self._filter(
-            out_audio, self.high_sos, self.out_high_zi
-        )
-        in_bass, self.in_low_zi = self._filter(
-            in_audio, self.low_sos, self.in_low_zi
-        )
-        in_high, self.in_high_zi = self._filter(
-            in_audio, self.high_sos, self.in_high_zi
-        )
-        return out_bass, out_high, in_bass, in_high
+        o_lplow, self.out_low_zi = self._filter(out_audio, self.low_sos, self.out_low_zi)
+        o_lpmid, self.out_mid_zi = self._filter(out_audio, self.mid_sos, self.out_mid_zi)
+        i_lplow, self.in_low_zi  = self._filter(in_audio,  self.low_sos, self.in_low_zi)
+        i_lpmid, self.in_mid_zi  = self._filter(in_audio,  self.mid_sos, self.in_mid_zi)
+        o_low, o_mid, o_high = o_lplow, o_lpmid - o_lplow, out_audio - o_lpmid
+        i_low, i_mid, i_high = i_lplow, i_lpmid - i_lplow, in_audio - i_lpmid
+        return o_low, o_mid, o_high, i_low, i_mid, i_high
 
 
 # ── Crossfade shapes ──────────────────────────────────────────────────────────
@@ -289,20 +304,90 @@ def _loudness_match(
     return (audio * (10.0 ** (gain_db / 20.0))).astype(np.float32)
 
 
+# ── Breakpoint EQ automation ───────────────────────────────────────────────────
+#
+# A crossfade is described by automation "lanes": piecewise-linear breakpoints
+# over the crossfade phase (0 → 1). Each track has a volume lane plus one gain
+# lane per EQ band (low/mid/high), so a style is just a table of curves — much
+# more expressive than a few scalar knobs, and the natural way to model a DJ
+# riding three EQ faders. (Idea from Vande Veire & De Bie's auto-DJ; their code
+# is AGPL, so this is a fresh implementation.)
+
+Lane = tuple  # ((phase, value), ...) with phase ascending, spanning 0..1
+
+
+def _sample_lane(points: Lane, phase: np.ndarray) -> np.ndarray:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return np.interp(phase, xs, ys).astype(np.float32)
+
+
+@dataclass
+class TransitionProfile:
+    """Per-track volume + 3-band gain automation for a crossfade."""
+    out_vol: Lane; out_low: Lane; out_mid: Lane; out_high: Lane
+    in_vol: Lane;  in_low: Lane;  in_mid: Lane;  in_high: Lane
+
+
+def _fade_out(hold: float = 0.0) -> Lane:
+    """1.0 held until `hold`, then an equal-power fall to 0 by phase 1."""
+    hold = float(np.clip(hold, 0.0, 0.8))
+    if hold <= 0.0:
+        return ((0.0, 1.0), (0.5, 0.707), (1.0, 0.0))
+    return ((0.0, 1.0), (hold, 1.0), ((hold + 1.0) / 2.0, 0.707), (1.0, 0.0))
+
+
+def _fade_in(lead: float = 0.0) -> Lane:
+    """0.0 held until `lead`, then an equal-power rise to 1 by phase 1."""
+    lead = float(np.clip(lead, 0.0, 0.8))
+    if lead <= 0.0:
+        return ((0.0, 0.0), (0.5, 0.707), (1.0, 1.0))
+    return ((0.0, 0.0), (lead, 0.0), ((lead + 1.0) / 2.0, 0.707), (1.0, 1.0))
+
+
+def _make_profile(cp: float, in_mid_lead: float, in_high_lead: float,
+                  out_mid_hold: float = 0.0, out_high_hold: float = 0.0,
+                  bass_w: float = 0.12) -> TransitionProfile:
+    """
+    Build a standard crossfade profile: the bass swaps from the outgoing to the
+    incoming track over a short window centred on `cp` (only one kick ever
+    plays), while the mid and high bands crossfade with independent timing — so
+    e.g. a swap can bring the incoming hats in early while holding its mids back.
+    """
+    cp = float(np.clip(cp, bass_w, 1.0 - bass_w))
+    out_low = ((0.0, 1.0), (cp - bass_w, 1.0), (cp + bass_w, 0.0), (1.0, 0.0))
+    in_low  = ((0.0, 0.0), (cp - bass_w, 0.0), (cp + bass_w, 1.0), (1.0, 1.0))
+    flat = ((0.0, 1.0), (1.0, 1.0))
+    return TransitionProfile(
+        out_vol=flat, out_low=out_low,
+        out_mid=_fade_out(out_mid_hold), out_high=_fade_out(out_high_hold),
+        in_vol=flat, in_low=in_low,
+        in_mid=_fade_in(in_mid_lead), in_high=_fade_in(in_high_lead),
+    )
+
+
 @dataclass
 class TransitionStyle:
     """
     How a crossfade behaves, chosen from the two tracks' dynamics at the mix
-    point. Different exits/entries want different slopes, filtering and lengths.
+    point. Different exits/entries want different lengths and EQ automation.
     """
     name: str
     n_bars: int                # crossfade length (cumulative time)
-    high_slope: float = 1.0    # >1 = incoming highs/percussion rise slower (less clash)
-    in_high_delay: float = 0.0 # phase in [0, 0.5) before incoming highs start entering
-    bass_swap_center: float = 0.5   # phase where the low end swaps tracks
-    bass_swap_width: float = 0.10   # how gradual the bass swap is
+    high_slope: float = 1.0    # legacy scalar knobs (used to build a default
+    in_high_delay: float = 0.0 # profile when `profile` is None)
+    bass_swap_center: float = 0.5
+    bass_swap_width: float = 0.10
     is_cut: bool = False       # short time-based fade instead of a bar-based blend
     cut_seconds: float = 0.30  # length of that fade when is_cut
+    profile: Optional[TransitionProfile] = None  # breakpoint EQ automation
+
+
+def _default_profile(style: TransitionStyle) -> TransitionProfile:
+    """Build a profile from a style's legacy scalar knobs (back-compat)."""
+    return _make_profile(style.bass_swap_center,
+                         in_mid_lead=style.in_high_delay,
+                         in_high_lead=style.in_high_delay)
 
 
 def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionStyle:
@@ -325,26 +410,27 @@ def choose_transition_style(out_cue, in_cue, beatmatched: bool) -> TransitionSty
     eo = out_cue.energy if out_cue else 0.5
     ei = in_cue.energy if in_cue else 0.5
 
-    if sim is not None and sim >= 0.82:
-        # High CLAP textural similarity: smooth 16-bar blend
-        return TransitionStyle("blend", 16, high_slope=1.0, in_high_delay=0.10,
-                               bass_swap_center=0.55, bass_swap_width=0.30)
+    def styled(name, n_bars, cp, mid_lead, high_lead,
+               out_mid_hold=0.0, out_high_hold=0.0):
+        return TransitionStyle(
+            name, n_bars,
+            profile=_make_profile(cp, mid_lead, high_lead,
+                                  out_mid_hold, out_high_hold),
+        )
 
-    if eo < 0.45 and ei < 0.45:
-        # Both sparse (breakdown/outro → intro): room for a long smooth blend
-        return TransitionStyle("blend", 16, high_slope=1.0, in_high_delay=0.10,
-                               bass_swap_center=0.55, bass_swap_width=0.30)
+    if (sim is not None and sim >= 0.82) or (eo < 0.45 and ei < 0.45):
+        # High textural similarity or both sparse: long, symmetric smooth blend.
+        return styled("blend", 16, cp=0.55, mid_lead=0.12, high_lead=0.12)
     if eo > 0.70 and ei > 0.70:
-        # Drop → drop: hold the incoming percussion back and swap bass quickly
-        return TransitionStyle("swap", 8, high_slope=2.0, in_high_delay=0.45,
-                               bass_swap_center=0.50, bass_swap_width=0.10)
+        # Drop → drop: bring the incoming HATS in early over the outgoing groove,
+        # hold its MIDS back to avoid clash, then swap the bass mid-way.
+        return styled("swap", 8, cp=0.50, mid_lead=0.50, high_lead=0.10,
+                      out_mid_hold=0.50, out_high_hold=0.30)
     if eo >= ei:
-        # Exiting a busier part into a calmer one: gentle medium fade
-        return TransitionStyle("fade", 12, high_slope=1.4, in_high_delay=0.20,
-                               bass_swap_center=0.55, bass_swap_width=0.20)
-    # Exiting a calm part into a rising one: bring the incoming up sooner
-    return TransitionStyle("build", 8, high_slope=0.8, in_high_delay=0.10,
-                           bass_swap_center=0.40, bass_swap_width=0.15)
+        # Busier → calmer: gentle medium fade, incoming eased in.
+        return styled("fade", 12, cp=0.55, mid_lead=0.30, high_lead=0.20)
+    # Calmer → rising: bring the incoming up sooner across all bands.
+    return styled("build", 8, cp=0.40, mid_lead=0.10, high_lead=0.05)
 
 
 
@@ -375,34 +461,30 @@ def _blend(
 
     if style is None:
         style = TransitionStyle("default", 0)
+    prof = style.profile or _default_profile(style)
 
     phase = np.asarray(phase, dtype=np.float32)
     if phase.ndim == 0:
         phase = np.full(n, float(phase), dtype=np.float32)
-    phase = phase[:n].reshape(-1, 1)
+    phase = phase[:n]
 
     if filter_state is None:
-        out_bass = _apply_lowpass(out_c, sr, bass_cutoff)
-        out_high = _apply_highpass(out_c, sr, bass_cutoff)
-        in_bass  = _apply_lowpass(in_c, sr, bass_cutoff)
-        in_high  = _apply_highpass(in_c, sr, bass_cutoff)
+        o_low, o_mid, o_high = _split3(out_c, sr)
+        i_low, i_mid, i_high = _split3(in_c, sr)
     else:
-        out_bass, out_high, in_bass, in_high = filter_state.split(out_c, in_c)
+        o_low, o_mid, o_high, i_low, i_mid, i_high = filter_state.split(out_c, in_c)
 
-    # Outgoing highs fade out across the region; incoming highs enter after a
-    # delay and rise with a shaped slope (higher slope = later/steeper).
-    out_g = np.cos(phase * (np.pi / 2.0))
-    d = style.in_high_delay
-    p_in = np.clip((phase - d) / max(1e-6, 1.0 - d), 0.0, 1.0) ** style.high_slope
-    in_g = np.sin(p_in * (np.pi / 2.0))
-    highs = out_high * out_g + in_high * in_g
+    def g(lane):
+        return _sample_lane(lane, phase).reshape(-1, 1)
 
-    # Single-source bass swap over a window centered on bass_swap_center
-    lo = style.bass_swap_center - style.bass_swap_width / 2.0
-    swap = np.clip((phase - lo) / max(1e-6, style.bass_swap_width), 0.0, 1.0) * (np.pi / 2.0)
-    bass = out_bass * np.cos(swap) + in_bass * np.sin(swap)
+    # Each track = volume × (per-band gain × band), a 3-fader DJ EQ ridden by
+    # the style's breakpoint automation.
+    out_mix = g(prof.out_vol) * (
+        g(prof.out_low) * o_low + g(prof.out_mid) * o_mid + g(prof.out_high) * o_high)
+    in_mix = g(prof.in_vol) * (
+        g(prof.in_low) * i_low + g(prof.in_mid) * i_mid + g(prof.in_high) * i_high)
 
-    return (highs + bass).astype(np.float32)
+    return (out_mix + in_mix).astype(np.float32)
 
 
 # ── Main transition renderer ──────────────────────────────────────────────────
