@@ -437,6 +437,61 @@ def cmd_render_set(args):
         print(f"    {int(m)}:{s:04.1f}  [{detail}]  {mk.label[:50]}")
 
 
+def cmd_splice(args):
+    """
+    Build a collage set: short segments of many tracks spliced together at
+    CLAP-serendipitous cut points, filling a target length.
+    """
+    import soundfile as sf
+    from infinite_dj.mixer import render_set
+
+    db = TrackDB(args.db)
+    tracks = db.load_all()
+    db.close()
+
+    if len(tracks) < 2:
+        print("Need at least 2 analyzed tracks.")
+        return
+
+    target_sec = args.length * 60.0
+    min_seg, max_seg = args.min_seg, args.max_seg
+    if min_seg >= max_seg:
+        print("--min-seg must be less than --max-seg.")
+        return
+
+    # Enough segments (with repeats) to fill the target, plus a small buffer.
+    avg_seg = (min_seg + max_seg) / 2.0
+    n_seg = int(target_sec / avg_seg) + 4
+    cooldown = min(4, len(tracks) - 1)
+
+    print(f"Building {args.arc} splice sequence "
+          f"(~{n_seg} segments, {min_seg:.0f}-{max_seg:.0f}s each) for "
+          f"{args.length:.0f} min...")
+    seq = sequence_for_mixing(tracks, arc=args.arc, n_tracks=n_seg,
+                              allow_repeats=True, cooldown=cooldown)
+
+    print(f"\nSplicing {len(seq.tracks)} segments...")
+    audio, sr, markers = render_set(
+        seq.tracks, min_seg_sec=min_seg, max_seg_sec=max_seg,
+        target_length_sec=target_sec)
+
+    sf.write(args.out, audio, sr, subtype='PCM_16')
+    duration = len(audio) / sr
+    mb = os.path.getsize(args.out) / 1024 / 1024
+
+    print(f"\nSplice set rendered: {args.out}")
+    print(f"  {sr} Hz / 16-bit | Duration: {duration/60:.1f} min | "
+          f"{len(markers)} splices | Size: {mb:.1f} MB")
+    print(f"\n  Splices:")
+    prev = 0.0
+    for mk in markers:
+        m, s = divmod(mk.time, 60)
+        seg = mk.time - prev
+        prev = mk.time
+        out_name = mk.label.split(" → ")[0].split(" - ")[-1][:34]
+        print(f"    {int(m)}:{s:04.1f}  (+{seg:4.0f}s)  [{mk.style}]  → {out_name}")
+
+
 def cmd_play(args):
     """
     Start the real-time infinite DJ engine.
@@ -546,6 +601,19 @@ def main():
     p_set.add_argument("--arc", default="peak",
                        choices=["peak", "steady", "build", "wave"])
 
+    # splice
+    p_splice = sub.add_parser("splice",
+                              help="Collage set from short segments of many tracks")
+    p_splice.add_argument("--out", required=True, help="Output WAV file path")
+    p_splice.add_argument("--length", type=float, default=10.0,
+                          help="Target total length in minutes (default 10)")
+    p_splice.add_argument("--min-seg", type=float, default=20.0, dest="min_seg",
+                          help="Minimum segment length in seconds (default 20)")
+    p_splice.add_argument("--max-seg", type=float, default=120.0, dest="max_seg",
+                          help="Maximum segment length in seconds (default 120)")
+    p_splice.add_argument("--arc", default="steady",
+                          choices=["peak", "steady", "build", "wave"])
+
     # play
     p_play = sub.add_parser("play", help="Start real-time infinite DJ engine")
     p_play.add_argument("--start", help="Starting track (partial title)")
@@ -567,6 +635,7 @@ def main():
         "mix":        cmd_mix,
         "sequence":   cmd_sequence,
         "render-set": cmd_render_set,
+        "splice":     cmd_splice,
         "play":       cmd_play,
     }
 

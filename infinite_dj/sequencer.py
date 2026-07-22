@@ -249,14 +249,20 @@ def sequence_for_mixing(
     n_tracks: Optional[int] = None,
     max_stretch: float = 0.08,
     seed: Optional[int] = None,
+    allow_repeats: bool = False,
+    cooldown: int = 4,
 ) -> Sequence:
     """
     Order tracks for a smooth mixed set: strongly prefer beat-matchable
     (tempo-compatible) neighbours so the render uses gentle blends rather than
-    hard cuts, while still respecting harmony and the energy arc.
+    hard cuts, while still respecting harmony, energy arc and timbre (CLAP).
 
     This is the sequencer `render-set` uses — it trades some energy-arc
     precision for far fewer jarring tempo cuts.
+
+    With `allow_repeats=True` (splice mode) tracks may recur after a `cooldown`
+    window and `n_tracks` may exceed the library size, so a long collage can be
+    built from a small pool.
     """
     if seed is not None:
         random.seed(seed)
@@ -300,9 +306,16 @@ def sequence_for_mixing(
 
     while len(seq_tracks) < n:
         pos = len(seq_tracks)
-        # Prefer tracks not yet used (a full set should be a permutation); only
-        # fall back to repeats if nothing unused is reachable.
-        candidates = [e for e in graph[current.file_path] if e.track_b not in used]
+        if allow_repeats:
+            # Splice mode: exclude only the last `cooldown` tracks, so a long
+            # collage can revisit the pool for variety.
+            recent = {t.file_path for t in seq_tracks[-cooldown:]}
+            candidates = [e for e in graph[current.file_path]
+                          if e.track_b not in recent]
+        else:
+            # Full set: a permutation — prefer unused, repeat only if stuck.
+            candidates = [e for e in graph[current.file_path]
+                          if e.track_b not in used]
         if not candidates:
             candidates = graph[current.file_path]
         if not candidates:

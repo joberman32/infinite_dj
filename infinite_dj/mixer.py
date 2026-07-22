@@ -692,6 +692,27 @@ def _pick_exit_cue(track: TrackMeta, min_t: float, max_t: float,
     return max(groovy or outs, key=lambda c: c.confidence)
 
 
+def _pick_splice_exit(cur_t: TrackMeta, nxt_t: TrackMeta, min_t: float, max_t: float):
+    """
+    For splice mode: choose the OUT cue in the [min_t, max_t] window whose CLAP
+    embedding best matches the next track's entry cue — a serendipitous splice
+    point where the two textures connect. Falls back to the strongest cue (or
+    the latest one) when embeddings are absent.
+    """
+    outs = [c for c in cur_t.cue_points if c.type == "out" and min_t <= c.timestamp <= max_t]
+    if not outs:
+        return None
+    nxt_in = best_cue_in(nxt_t)
+    try:
+        from .sequencer import cue_cosine_similarity
+        scored = [(c, cue_cosine_similarity(c, nxt_in)) for c in outs]
+        if any(s is not None for _, s in scored):
+            return max(scored, key=lambda cs: cs[1] if cs[1] is not None else -1.0)[0]
+    except Exception:
+        pass
+    return max(outs, key=lambda c: c.confidence)
+
+
 def _match_entry(track: TrackMeta, target_energy: float,
                  min_frac: float = 0.02, max_frac: float = 0.55,
                  groove_floor: float = 0.35) -> CuePoint:
@@ -733,25 +754,29 @@ def render_set(
     sr: int = MIX_SR,
     max_stretch: float = MAX_STRETCH,
     min_solo_bars: int = 32,
+    min_seg_sec: Optional[float] = None,
+    max_seg_sec: Optional[float] = None,
+    target_length_sec: Optional[float] = None,
 ) -> tuple:
     """
     Render an ordered list of tracks into ONE continuous set.
 
-    Design goals:
-      - Tracks breathe: each plays a substantial solo (>= min_solo_bars) and
-        only exits at a genuinely strong, phrase-aligned OUT cue.
-      - Transitions adapt to the music: `choose_transition_style` picks the
-        length, slope, filtering and bass-swap timing from the energy at the
-        exit and entry, so a drop→drop swaps quickly while a breakdown→intro
-        blends long. Tempo-incompatible pairs get a short cut, never a long
-        overlap of two unsynced grooves.
+    Two modes:
+      - Full-set (default): each track breathes (>= min_solo_bars) and exits at
+        a genuinely strong, phrase-aligned OUT cue.
+      - Splice (when `max_seg_sec` is given): each track plays only a short
+        segment bounded by [min_seg_sec, max_seg_sec], exiting at a CLAP-chosen
+        cue that connects to the next track's texture. Rendering stops once
+        `target_length_sec` is reached — a collage of many short segments.
 
-    Each track plays at its own native tempo; only the incoming crossfade region
-    is stretched to the outgoing tempo for a beat-locked overlap. Returns
-    (audio, sr, [SetMarker, ...]).
+    Transitions adapt via `choose_transition_style`; each track plays at its own
+    native tempo, only the incoming crossfade region is stretched to lock beats.
+    Returns (audio, sr, [SetMarker, ...]).
     """
     if len(tracks) < 2:
         raise ValueError("Need at least 2 tracks to render a set")
+
+    splice = max_seg_sec is not None
 
     def load_matched(t):
         a, _ = _load_audio(t.file_path, sr)
@@ -792,15 +817,28 @@ def render_set(
         ratio = min(ratios, key=lambda r: abs(r - 1.0))
         beatmatched = abs(ratio - 1.0) <= max_stretch
 
-        # ── Outgoing exit: breathe, then leave at a strong cue that still has a
-        #    groove (so the outgoing carries a beat into the crossfade) ─────────
-        min_exit_t = read_t + min_solo_bars * out_bar_sec
-        out_cue = _pick_exit_cue(cur_t, min_exit_t, cur_dur)
-        if out_cue is not None:
-            cue_out_t = out_cue.timestamp
+        # ── Outgoing exit ──────────────────────────────────────────────────────
+        if splice:
+            # Short segment: exit within [min_seg, max_seg] at a CLAP-serendipitous
+            # splice point that connects to the next track's texture.
+            min_exit_t = read_t + (min_seg_sec or 0.0)
+            max_exit_t = min(read_t + max_seg_sec, cur_dur)
+            out_cue = _pick_splice_exit(cur_t, nxt_t, min_exit_t, max_exit_t)
+            if out_cue is not None:
+                cue_out_t = out_cue.timestamp
+            else:
+                inwin = [d for d in cur_t.downbeats if min_exit_t <= d <= max_exit_t]
+                cue_out_t = inwin[-1] if inwin else max(read_t, max_exit_t - out_bar_sec)
         else:
-            later = [d for d in cur_t.downbeats if min_exit_t <= d < cur_dur]
-            cue_out_t = later[0] if later else max(read_t, cur_dur - out_bar_sec)
+            # Breathe, then leave at a strong cue that still has a groove (so the
+            # outgoing carries a beat into the crossfade).
+            min_exit_t = read_t + min_solo_bars * out_bar_sec
+            out_cue = _pick_exit_cue(cur_t, min_exit_t, cur_dur)
+            if out_cue is not None:
+                cue_out_t = out_cue.timestamp
+            else:
+                later = [d for d in cur_t.downbeats if min_exit_t <= d < cur_dur]
+                cue_out_t = later[0] if later else max(read_t, cur_dur - out_bar_sec)
         cue_out_sample = max(read, _time_to_samples(cue_out_t, sr))
         target_e = out_cue.energy if out_cue else 0.5
 
@@ -824,11 +862,18 @@ def render_set(
         in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
 
         # ── Build the crossfade regions ────────────────────────────────────────
+        # In splice mode the crossfade must fit inside a short segment, so cap it
+        # to ~1/3 of the segment (min 2 bars); otherwise use the style's length.
+        n_bars = style.n_bars
+        if splice and not style.is_cut:
+            seg_len = max(0.0, cue_out_sample / sr - read_t)
+            n_bars = max(2, min(n_bars, int((seg_len / 3.0) / out_bar_sec)))
+
         # Guarantee the outgoing track has a full overlap's worth of audio after
         # the exit cue — otherwise a cue near the track end collapses the blend
         # into a 1-2s stub (a "quick fade" instead of a real crossfade).
         mix_out_s = (_time_to_samples(style.cut_seconds, sr) if style.is_cut
-                     else style.n_bars * out_bar_s)
+                     else n_bars * out_bar_s)
         cue_out_sample = min(cue_out_sample, max(read, len(cur_audio) - mix_out_s))
 
         if style.is_cut:
@@ -838,7 +883,7 @@ def render_set(
             ratio   = 1.0
         else:
             out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
-            in_region = nxt_audio[in_sample:in_sample + style.n_bars * in_bar_s]
+            in_region = nxt_audio[in_sample:in_sample + n_bars * in_bar_s]
             if beatmatched and abs(ratio - 1.0) > 0.001:
                 in_mix = _time_stretch(in_region, sr, ratio)   # → outgoing tempo
             else:
@@ -880,8 +925,16 @@ def render_set(
         cur_audio = nxt_audio
         read      = in_sample + consumed_in
 
+        # Splice mode: stop once we've filled the target length.
+        if target_length_sec is not None and written / sr >= target_length_sec:
+            break
+
     # ── Final track tail (capped) with a gentle fade-out ───────────────────────
-    max_tail = _time_to_samples((60.0 / cur_t.bpm) * 4 * 32, sr)   # up to 32 bars
+    if splice:
+        # One last short segment so we don't end mid-crossfade.
+        max_tail = _time_to_samples(min(max_seg_sec, (min_seg_sec or 20.0)), sr)
+    else:
+        max_tail = _time_to_samples((60.0 / cur_t.bpm) * 4 * 32, sr)   # up to 32 bars
     tail = cur_audio[read:read + max_tail].copy()
     fade_s = min(int(2.0 * sr), len(tail))
     if fade_s > 0:

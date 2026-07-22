@@ -4,6 +4,20 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-22 — Splice mode (short-segment collage sets)
+
+- New `splice` command / `render_set` mode: build a target-length collage from
+  short segments of many tracks instead of full tracks. Params `--length` (min),
+  `--min-seg`/`--max-seg` (seconds). Each track plays only a bounded segment and
+  exits at a CLAP-serendipitous cut point (`_pick_splice_exit` picks the OUT cue
+  whose embedding best matches the next track's entry); crossfades are capped to
+  ~1/3 of the segment so they fit; rendering stops at the target length.
+- `sequence_for_mixing(allow_repeats=True, cooldown=N)` lets a long collage
+  revisit a small pool (n_tracks may exceed library size) with a recency window.
+- `render_set(min_seg_sec, max_seg_sec, target_length_sec)` drive the mode;
+  default (full-set) behavior unchanged. Verified: 10-min and 5-min collages,
+  zero interior silence gaps.
+
 ## 2026-07-22 — CLAP validated and wired into set ordering
 
 - First real end-to-end run of CLAP (torch/transformers installed from the
