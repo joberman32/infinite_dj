@@ -508,6 +508,61 @@ def _set_entry_cue(track: TrackMeta, max_frac: float = 0.4):
     return min(ins, key=lambda c: c.timestamp) if ins else None
 
 
+def _energy_at(track: TrackMeta, t: float) -> float:
+    ec = track.energy_curve
+    return float(ec[min(int(t), len(ec) - 1)]) if ec else 0.5
+
+
+def _pick_exit_cue(track: TrackMeta, min_t: float, max_t: float,
+                   groove_floor: float = 0.4):
+    """
+    Best OUT cue past the dwell that still has a groove going (energy >= floor),
+    so the outgoing carries a beat into the crossfade instead of exiting from a
+    dead valley. Falls back to the strongest available cue.
+    """
+    outs = [c for c in track.cue_points
+            if c.type == "out" and min_t <= c.timestamp < max_t]
+    if not outs:
+        return None
+    groovy = [c for c in outs if c.energy >= groove_floor]
+    return max(groovy or outs, key=lambda c: c.confidence)
+
+
+def _match_entry(track: TrackMeta, target_energy: float,
+                 min_frac: float = 0.02, max_frac: float = 0.55,
+                 groove_floor: float = 0.35) -> CuePoint:
+    """
+    For a beat-locked blend, enter the incoming where its groove is *already
+    going* at an energy close to the outgoing exit — so two rhythms overlap and
+    lock, rather than overlapping a groove with a silent intro. Searches the
+    track's own downbeats (not just the low-energy scored IN cues), preferring
+    phrase-aligned ones whose energy matches the target.
+    """
+    dur = track.duration or 0.0
+    phrases = track.phrases or []
+    lo, hi = dur * min_frac, max(dur * max_frac, 1.0)
+    cands = [d for d in track.downbeats if lo <= d <= hi]
+    if not cands:
+        return _set_entry_cue(track) or CuePoint(0.0, "in", True, 0.5, 0.1)
+
+    def near_phrase(d):
+        return min((abs(d - p) for p in phrases), default=99.0) < 1.0
+
+    def score(d):
+        e = _energy_at(track, d)
+        s = -abs(e - target_energy)          # match the outgoing's energy
+        if e >= groove_floor:
+            s += 0.3                          # prefer an established groove
+        if near_phrase(d):
+            s += 0.2                          # prefer phrase boundaries
+        return s
+
+    best = max(cands, key=score)
+    return CuePoint(timestamp=round(best, 3), type="in",
+                    phrase_aligned=near_phrase(best),
+                    energy=round(_energy_at(track, best), 3), confidence=0.5)
+
+
 def render_set(
     tracks: list,
     n_mix_bars: int = 16,
@@ -565,24 +620,29 @@ def render_set(
         ratio = min(ratios, key=lambda r: abs(r - 1.0))
         beatmatched = abs(ratio - 1.0) <= max_stretch
 
-        # ── Incoming entry: an early IN cue so the track plays a full solo ─────
-        in_cue  = _set_entry_cue(nxt_t)
-        in_time = in_cue.timestamp if in_cue else (nxt_t.downbeats[0] if nxt_t.downbeats else 0.0)
-        in_time = _find_nearest_downbeat(
-            in_time, nxt_t.downbeats, max_offset=(60.0 / nxt_t.bpm) * 4 / 2.0
-        )
-        in_sample = _time_to_samples(in_time, sr)
-
-        # ── Outgoing exit: let the track breathe, then leave at a strong cue ───
+        # ── Outgoing exit: breathe, then leave at a strong cue that still has a
+        #    groove (so the outgoing carries a beat into the crossfade) ─────────
         min_exit_t = read_t + min_solo_bars * out_bar_sec
-        out_cue = _best_out_cue_after(cur_t, min_exit_t, cur_dur)
+        out_cue = _pick_exit_cue(cur_t, min_exit_t, cur_dur)
         if out_cue is not None:
             cue_out_t = out_cue.timestamp
         else:
-            # No strong cue after the dwell — exit on the next downbeat past it.
             later = [d for d in cur_t.downbeats if min_exit_t <= d < cur_dur]
             cue_out_t = later[0] if later else max(read_t, cur_dur - out_bar_sec)
         cue_out_sample = max(read, _time_to_samples(cue_out_t, sr))
+        target_e = out_cue.energy if out_cue else 0.5
+
+        # ── Incoming entry ─────────────────────────────────────────────────────
+        # Beat-locked transitions enter where the incoming groove matches the
+        # exit's energy (two rhythms lock); cuts just enter early.
+        if beatmatched:
+            in_cue = _match_entry(nxt_t, target_e)
+        else:
+            in_cue = _set_entry_cue(nxt_t) or CuePoint(0.0, "in", True, 0.5, 0.1)
+        in_time = _find_nearest_downbeat(
+            in_cue.timestamp, nxt_t.downbeats, max_offset=(60.0 / nxt_t.bpm) * 4 / 2.0
+        )
+        in_sample = _time_to_samples(in_time, sr)
 
         # ── Pick a crossfade style from the two tracks' dynamics ───────────────
         style = choose_transition_style(out_cue, in_cue, beatmatched)
