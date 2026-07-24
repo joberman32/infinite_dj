@@ -1,5 +1,5 @@
 from infinite_dj.models import TrackMeta
-from infinite_dj.timeline import build_timeline, _track_id
+from infinite_dj.timeline import build_timeline, _short_title, _track_id
 
 
 def _track(path, title, bpm, key):
@@ -41,3 +41,11 @@ def test_build_timeline_handles_missing_track_meta():
     tl = build_timeline(clips, [], duration=10.0)
     assert len(tl["clips"]) == 1
     assert _track_id("ghost.mp3") in tl["tracks"]
+
+
+def test_short_title_normalizes_archive_and_track_number_prefixes():
+    assert _short_title(
+        "gargan059_02_Vlad_Antonenko_-_Dance_Groove.flac"
+    ) == "Dance Groove"
+    assert _short_title("12 Iketa.flac") == "Iketa"
+    assert _short_title("04 If It Really Is Me") == "If It Really Is Me"

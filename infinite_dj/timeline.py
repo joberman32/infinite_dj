@@ -11,6 +11,8 @@ the real-time engine.
 
 import hashlib
 import json
+import os
+import re
 from typing import List
 
 import numpy as np
@@ -30,8 +32,16 @@ def _color_for(file_path: str) -> str:
 
 
 def _short_title(title: str) -> str:
-    # Strip a common "Artist - Album - NN Track" prefix down to the track name.
-    return title.split(" - ")[-1].strip()
+    """Turn archive/catalog filenames into a concise, human-facing track name."""
+    title = os.path.splitext(os.path.basename(title))[0]
+    title = title.replace("_", " ")
+    title = re.sub(r"\s*-\s*", " - ", title)
+    title = re.sub(r"^[a-z][a-z0-9-]*\d+\s+\d+\s+", "", title,
+                   flags=re.IGNORECASE)
+    title = re.sub(r"^\d{1,3}\s+", "", title)
+    # Prefer the song portion of "Artist - Track" and longer catalog strings.
+    title = title.split(" - ")[-1]
+    return re.sub(r"\s+", " ", title).strip()
 
 
 def build_timeline(clips: List[dict], tracks: List[TrackMeta],

@@ -13,16 +13,23 @@ const fmt = (s) => {
   return `${(s / 60) | 0}:${String(s % 60).padStart(2, "0")}`;
 };
 
+function readableTrackTitle(raw) {
+  let title = (raw || "Unknown track").replace(/\.[^.]+$/, "").replaceAll("_", " ");
+  title = title.replace(/\s*-\s*/g, " - ");
+  title = title.replace(/^[a-z][a-z0-9-]*\d+\s+\d+\s+/i, "");
+  title = title.replace(/^\d{1,3}\s+/, "");
+  const parts = title.split(" - ");
+  return parts[parts.length - 1].replace(/\s+/g, " ").trim();
+}
+
 function clipLabel(c) {
   if (!c) return "—";
-  const title = (TRACKS[c.track] || {}).title || "Unknown track";
+  const title = readableTrackTitle((TRACKS[c.track] || {}).title);
   const section = c.section || "segment";
-  const siblings = TL.clips.filter(
-    (other) => other.track === c.track && (other.section || "segment") === section
-  );
-  if (siblings.length < 2) return `${title} + ${section}`;
-  const occurrence = siblings.indexOf(c) + 1;
-  return `${title} + ${section} ${occurrence}/${siblings.length}`;
+  const trackClips = TL.clips.filter((other) => other.track === c.track);
+  const ordinal = trackClips.indexOf(c) + 1;
+  const sectionCode = section.charAt(0).toUpperCase();
+  return `${title} · ${ordinal}${sectionCode}`;
 }
 
 // ── PlayerState from clips ───────────────────────────────────────────────────
