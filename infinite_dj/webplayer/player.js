@@ -7,80 +7,11 @@ const $ = (id) => document.getElementById(id);
 const audio = $("audio");
 let TL = null;              // timeline data
 let TRACKS = {};           // id -> track meta
-const wheelWedges = {};    // camelot code -> <path>
-let lastKey = null, lastInc = null;
 
 const fmt = (s) => {
   s = Math.max(0, s | 0);
   return `${(s / 60) | 0}:${String(s % 60).padStart(2, "0")}`;
 };
-
-// ── Camelot helpers ──────────────────────────────────────────────────────────
-const parseKey = (k) => k && /^\d{1,2}[AB]$/.test(k)
-  ? { num: parseInt(k), letter: k.slice(-1) } : null;
-function camelotRel(a, b) {          // relationship class of b to current a
-  const pa = parseKey(a), pb = parseKey(b);
-  if (!pa || !pb) return "";
-  if (pa.num === pb.num && pa.letter === pb.letter) return "cur";
-  if (pa.num === pb.num) return "rel";                       // relative maj/min
-  const d = Math.min(Math.abs(pa.num - pb.num), 12 - Math.abs(pa.num - pb.num));
-  if (pa.letter === pb.letter && d === 1) return "adj";      // ±1 on the wheel
-  return "";
-}
-
-// ── Build the Camelot wheel (24 wedges) ──────────────────────────────────────
-function wedgePath(rIn, rOut, a0, a1) {
-  const p = (r, a) => [r * Math.cos(a), r * Math.sin(a)];
-  const [x0, y0] = p(rOut, a0), [x1, y1] = p(rOut, a1);
-  const [x2, y2] = p(rIn, a1), [x3, y3] = p(rIn, a0);
-  const large = a1 - a0 > Math.PI ? 1 : 0;
-  return `M${x0} ${y0}A${rOut} ${rOut} 0 ${large} 1 ${x1} ${y1}`
-       + `L${x2} ${y2}A${rIn} ${rIn} 0 ${large} 0 ${x3} ${y3}Z`;
-}
-function buildWheel() {
-  const svg = $("wheel");
-  const SVGNS = "http://www.w3.org/2000/svg";
-  for (let n = 1; n <= 12; n++) {
-    const a0 = (n - 1) / 12 * 2 * Math.PI - Math.PI / 2 - Math.PI / 12;
-    const a1 = a0 + Math.PI / 6;
-    const mid = (a0 + a1) / 2;
-    const hue = (n - 1) / 12 * 360;
-    for (const [letter, rIn, rOut] of [["A", 44, 74], ["B", 74, 100]]) {
-      const code = `${n}${letter}`;
-      const path = document.createElementNS(SVGNS, "path");
-      path.setAttribute("d", wedgePath(rIn, rOut, a0, a1));
-      path.setAttribute("class", "wedge");
-      path.dataset.hue = hue;
-      path.dataset.code = code;
-      path.style.fill = `hsl(${hue} 55% ${letter === "A" ? 34 : 46}%)`;
-      path.style.opacity = 0.35;
-      svg.appendChild(path);
-      wheelWedges[code] = path;
-      const lr = (rIn + rOut) / 2;
-      const label = document.createElementNS(SVGNS, "text");
-      label.setAttribute("x", lr * Math.cos(mid));
-      label.setAttribute("y", lr * Math.sin(mid));
-      label.setAttribute("class", "wlabel");
-      label.textContent = code;
-      svg.appendChild(label);
-    }
-  }
-}
-function paintWheel(curKey, incKey) {
-  if (curKey === lastKey && incKey === lastInc) return;
-  lastKey = curKey; lastInc = incKey;
-  for (const [code, el] of Object.entries(wheelWedges)) {
-    const rel = camelotRel(curKey, code);
-    let op = 0.28, stroke = "var(--panel)", sw = 1.2;
-    if (code === incKey) { op = 1; stroke = "var(--accent)"; sw = 2.4; }
-    else if (rel === "cur") { op = 1; stroke = "#fff"; sw = 2.4; }
-    else if (rel === "rel") op = 0.7;
-    else if (rel === "adj") op = 0.55;
-    el.style.opacity = op;
-    el.style.stroke = stroke;
-    el.style.strokeWidth = sw;
-  }
-}
 
 // ── PlayerState from clips ───────────────────────────────────────────────────
 function clipGain(c, t) {
@@ -114,7 +45,16 @@ function playerState(t) {
   let upcoming = null, best = Infinity;
   for (const c of TL.clips)
     if (c.start > t && c.start < best) { best = c.start; upcoming = c; }
-  return { active: act, primary, transition, upcoming, t };
+  // Previous: the clip that started most recently before the primary clip.
+  let prev = null;
+  if (primary) {
+    let bestStart = -Infinity;
+    for (const c of TL.clips)
+      if (c.start < primary.c.start && c.start > bestStart && c.track !== primary.c.track) {
+        bestStart = c.start; prev = c;
+      }
+  }
+  return { active: act, primary, transition, upcoming, prev, t };
 }
 
 // ── Render ───────────────────────────────────────────────────────────────────
@@ -125,83 +65,75 @@ function render(t) {
 
   if (p) {
     const tr = TRACKS[p.track] || {};
-    document.documentElement.style.setProperty("--now", tr.color || "#6ea8fe");
-    $("now-title").textContent = tr.title || "—";
-    $("now-meta").textContent = `${(p.key || tr.key || "")}  ·  ${Math.round(p.bpm || tr.bpm || 0)} BPM`;
-    $("now-section").textContent = p.section ? p.section : "";
-    $("now-mode").textContent = st.transition ? st.transition.mode : (p.mode || "playing");
-    // energy meter from the primary track
-    $("energy-fill").style.width = `${Math.round((tr.energy ?? 0.5) * 100)}%`;
+    $("cur-title").textContent = tr.title || "—";
+    $("cur-bpm").textContent = `${Math.round(p.bpm || tr.bpm || 0)} BPM`;
   }
 
-  // Other active layers (collage) — only ones actually audible
-  const others = st.active.slice(1).filter((x) => x.g > 0.1).slice(0, 4);
-  $("layers").innerHTML = others.map(({ c }) => {
-    const tr = TRACKS[c.track] || {};
-    return `<span class="chip"><span class="dot" style="background:${tr.color}"></span>${tr.title || ""}</span>`;
-  }).join("");
+  const prevTr = st.prev ? (TRACKS[st.prev.track] || {}) : null;
+  $("prev-title").textContent = prevTr ? (prevTr.title || "") : "—";
+  const nextTr = st.upcoming ? (TRACKS[st.upcoming.track] || {}) : null;
+  $("next-title").textContent = nextTr ? (nextTr.title || "") : "—";
 
-  // Crossfade ring
+  // Crossfade fill, inline between current and next
   const xf = $("xfade");
   if (st.transition) {
     xf.classList.remove("hidden");
     const pct = Math.round(st.transition.progress * 100);
-    $("ring-fg").style.strokeDashoffset = 327 * (1 - st.transition.progress);
-    $("xfade-pct").textContent = `${pct}%`;
-    $("xfade-mode").textContent = st.transition.mode;
+    $("xfade-fill").style.width = `${pct}%`;
+    $("xfade-pct").textContent = `MIXING ${pct}%`;
   } else xf.classList.add("hidden");
-
-  // Camelot wheel
-  paintWheel(p ? (p.key) : null, st.transition ? st.transition.to.key : null);
-
-  // Up next
-  if (st.upcoming) {
-    const tr = TRACKS[st.upcoming.track] || {};
-    $("upnext").innerHTML = `Up next · <b>${tr.title || ""}</b> in ${Math.max(0, st.upcoming.start - t) | 0}s`;
-  } else $("upnext").textContent = "";
-
-  drawTimeline(t);
 }
 
-// ── Mini arrangement timeline (canvas) ───────────────────────────────────────
-function drawTimeline(t) {
-  const cv = $("tlcanvas"), ctx = cv.getContext("2d");
-  const dpr = window.devicePixelRatio || 1;
-  const W = cv.clientWidth, H = cv.clientHeight;
-  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, W, H);
-  const dur = TL.duration || 1;
-  // lane packing: greedily assign clips to rows that are free
-  const lanes = [];
-  const laneOf = new Map();
-  for (const c of TL.clips) {
-    let i = 0;
-    for (; i < lanes.length; i++) if (lanes[i] <= c.start) break;
-    lanes[i] = c.end; laneOf.set(c, i);
+// ── Stereo power meter (Web Audio API) ───────────────────────────────────────
+let actx = null, analyserL = null, analyserR = null, meterBufL = null, meterBufR = null;
+let peakL = 0, peakR = 0;
+
+function ensureMeterGraph() {
+  if (actx) return;
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaElementSource(audio);
+    src.connect(actx.destination);           // keep audio audible
+    const splitter = actx.createChannelSplitter(2);
+    src.connect(splitter);
+    analyserL = actx.createAnalyser(); analyserL.fftSize = 512;
+    analyserR = actx.createAnalyser(); analyserR.fftSize = 512;
+    splitter.connect(analyserL, 0);
+    splitter.connect(analyserR, 1);
+    meterBufL = new Uint8Array(analyserL.fftSize);
+    meterBufR = new Uint8Array(analyserR.fftSize);
+  } catch (e) {
+    console.warn("Stereo meter unavailable:", e);
+    actx = null;
   }
-  const rows = Math.max(1, lanes.length);
-  const rh = Math.min(14, (H - 6) / rows);
-  for (const c of TL.clips) {
-    const x = (c.start / dur) * W, w = Math.max(2, ((c.end - c.start) / dur) * W);
-    const y = 3 + laneOf.get(c) * rh;
-    const tr = TRACKS[c.track] || {};
-    const on = t >= c.start && t < c.end;
-    ctx.globalAlpha = on ? 0.95 : 0.5;
-    ctx.fillStyle = tr.color || "#6ea8fe";
-    roundRect(ctx, x, y, w, rh - 2, 3); ctx.fill();
-  }
-  ctx.globalAlpha = 1;
-  const px = (t / dur) * W;
-  ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
 }
-function roundRect(ctx, x, y, w, h, r) {
-  r = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+
+function rms(analyser, buf) {
+  analyser.getByteTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = (buf[i] - 128) / 128;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / buf.length);
+}
+
+let smoothL = 0, smoothR = 0;
+function updateMeters() {
+  let lvL = 0, lvR = 0;
+  if (analyserL && analyserR && !audio.paused) {
+    lvL = Math.min(1, rms(analyserL, meterBufL) * 3.2);
+    lvR = Math.min(1, rms(analyserR, meterBufR) * 3.2);
+  }
+  // Fast attack, slower release, so it reads like a real meter.
+  smoothL = lvL > smoothL ? lvL : smoothL * 0.85;
+  smoothR = lvR > smoothR ? lvR : smoothR * 0.85;
+  $("meter-l").style.height = `${smoothL * 100}%`;
+  $("meter-r").style.height = `${smoothR * 100}%`;
+  peakL = Math.max(smoothL, peakL - 0.012);
+  peakR = Math.max(smoothR, peakR - 0.012);
+  $("peak-l").style.bottom = `${peakL * 100}%`;
+  $("peak-r").style.bottom = `${peakR * 100}%`;
 }
 
 // ── Transport ────────────────────────────────────────────────────────────────
@@ -213,9 +145,17 @@ function loop() {
   $("scrub-fill").style.width = `${frac * 100}%`;
   $("scrub-head").style.left = `${frac * 100}%`;
   render(t);
-  requestAnimationFrame(loop);
+  updateMeters();
 }
-$("playbtn").onclick = () => audio.paused ? audio.play() : audio.pause();
+// Drive updates on a timer rather than requestAnimationFrame: rAF fully pauses
+// on hidden/background tabs (freezing the meters); a 30fps interval keeps the
+// live meters and clock running whenever the player is playing.
+setInterval(loop, 33);
+$("playbtn").onclick = () => {
+  ensureMeterGraph();
+  if (actx && actx.state === "suspended") actx.resume();
+  audio.paused ? audio.play() : audio.pause();
+};
 audio.addEventListener("play", () => $("playbtn").textContent = "❚❚");
 audio.addEventListener("pause", () => $("playbtn").textContent = "▶");
 $("scrub").onclick = (e) => {
@@ -225,9 +165,8 @@ $("scrub").onclick = (e) => {
 };
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
-buildWheel();
 fetch("/timeline.json").then((r) => r.json()).then((data) => {
   TL = data; TRACKS = data.tracks || {};
   $("dur").textContent = fmt(data.duration);
-  requestAnimationFrame(loop);
-}).catch((e) => { $("now-title").textContent = "Failed to load timeline"; console.error(e); });
+  loop();  // render once immediately; setInterval keeps it live
+}).catch((e) => { $("cur-title").textContent = "Failed to load timeline"; console.error(e); });

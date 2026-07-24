@@ -9,46 +9,48 @@
 <body>
   <div id="app">
     <header id="topbar">
-      <div class="brand">◉ INFINITE&nbsp;DJ</div>
+      <div class="brand">◉ INFINITE_DJ</div>
       <div id="clock"><span id="pos">0:00</span> / <span id="dur">0:00</span></div>
     </header>
 
     <main id="stage">
-      <!-- Now playing -->
-      <section id="nowcard" class="panel">
-        <div id="nowtint"></div>
-        <div class="now-inner">
-          <div id="now-mode" class="badge">—</div>
-          <div id="now-title" class="now-title">Loading…</div>
-          <div id="now-meta" class="now-meta"></div>
-          <div id="now-section" class="now-section"></div>
-          <div id="layers" class="layers"></div>
+      <!-- Prev / current / next track strip, with an inline crossfade fill -->
+      <section id="strip">
+        <div class="slot prev">
+          <div class="slot-label">PREV</div>
+          <div id="prev-title" class="slot-title">—</div>
         </div>
-        <div id="xfade" class="xfade hidden">
-          <svg viewBox="0 0 120 120" class="ring">
-            <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
-            <circle id="ring-fg" class="ring-fg" cx="60" cy="60" r="52"></circle>
-          </svg>
-          <div class="xfade-label"><span id="xfade-pct">0%</span><small id="xfade-mode"></small></div>
+
+        <div class="slot current">
+          <div class="slot-label">
+            <span id="cur-tag">NOW</span>
+            <span id="cur-bpm"></span>
+          </div>
+          <div id="cur-title" class="slot-title">Loading…</div>
+          <div id="xfade" class="xfade hidden">
+            <div class="xfade-track"><div id="xfade-fill"></div></div>
+            <div class="xfade-pct"><span id="xfade-pct">0%</span></div>
+          </div>
+        </div>
+
+        <div class="slot next">
+          <div class="slot-label">NEXT</div>
+          <div id="next-title" class="slot-title">—</div>
         </div>
       </section>
 
-      <!-- Camelot wheel + energy -->
-      <section id="side" class="panel">
-        <div class="side-title">Harmony</div>
-        <svg id="wheel" viewBox="-110 -110 220 220" aria-label="Camelot wheel"></svg>
-        <div class="energy">
-          <div class="energy-label">Energy</div>
-          <div class="energy-track"><div id="energy-fill"></div></div>
+      <!-- Live stereo power meter -->
+      <section id="meter">
+        <div class="meter-chan">
+          <div class="meter-track"><div id="meter-l" class="meter-fill"></div><div id="peak-l" class="peak"></div></div>
+          <div class="meter-tag">L</div>
         </div>
-        <div id="upnext" class="upnext"></div>
+        <div class="meter-chan">
+          <div class="meter-track"><div id="meter-r" class="meter-fill"></div><div id="peak-r" class="peak"></div></div>
+          <div class="meter-tag">R</div>
+        </div>
       </section>
     </main>
-
-    <!-- Mini arrangement timeline -->
-    <div id="timeline" class="panel">
-      <canvas id="tlcanvas"></canvas>
-    </div>
 
     <!-- Transport -->
     <footer id="transport">
