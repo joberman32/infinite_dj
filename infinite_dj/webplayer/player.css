@@ -42,15 +42,19 @@ body {
 .current .slot-label { justify-content: center; gap: 10px; }
 #cur-tag { color: var(--fg); font-weight: 700; }
 #cur-bpm { color: var(--dim); }
-.current .slot-title { font-size: 26px; font-weight: 700; letter-spacing: -.01em;
-  white-space: normal; overflow-wrap: anywhere; word-break: break-word; margin-top: 10px; }
-
-/* Crossfade fill (inline, replaces the ring) */
-.xfade { margin-top: 14px; }
-.xfade.hidden { visibility: hidden; }
-.xfade-track { height: 2px; background: var(--line); position: relative; }
-#xfade-fill { height: 100%; width: 0%; background: var(--fg); }
-.xfade-pct { color: var(--dim); font-size: 11px; margin-top: 6px; letter-spacing: .08em; }
+.title-stack { display: grid; margin-top: 10px; }
+.current .title-stack .slot-title {
+  grid-area: 1 / 1;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -.01em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  margin: 0;
+  will-change: opacity, transform;
+}
+#incoming-title { opacity: 0; pointer-events: none; }
 
 /* Stereo power meter */
 #meter { display: flex; gap: 28px; justify-content: center; padding: 4px 0; }

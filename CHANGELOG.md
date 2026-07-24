@@ -16,6 +16,11 @@ captures constraints that may not be obvious from a local code path.
   (`P`eak, `R`ising, etc.). Archive prefixes, file extensions, underscores,
   and leading track numbers are removed from displayed titles. Adjacent
   segments from the same source track remain visible in the previous slot.
+- Replaced the numeric `MIXING %` bar with a minimalist title crossfade. During
+  an overlap, outgoing and incoming splice labels fade and drift through one
+  shared title position. Animation progress is normalized to the clips' actual
+  simultaneous overlap—not merely the incoming clip's longer fade-in envelope—
+  so the visual handoff completes when the outgoing audio ends.
 
 ## 2026-07-22 — Interactive web player (MVP, phased)
 

@@ -55,9 +55,15 @@ function playerState(t) {
   const newest = byStart[byStart.length - 1];
   if (newest && newest.c.fade_in > 0 && t < newest.c.start + newest.c.fade_in
       && byStart.length > 1) {
+    const outgoing = act.find((item) => item.c !== newest.c);
+    const overlapEnd = outgoing
+      ? Math.min(newest.c.start + newest.c.fade_in, outgoing.c.end)
+      : newest.c.start + newest.c.fade_in;
+    const overlapDuration = Math.max(0.001, overlapEnd - newest.c.start);
     transition = {
+      from: outgoing ? outgoing.c : null,
       to: newest.c,
-      progress: (t - newest.c.start) / newest.c.fade_in,
+      progress: (t - newest.c.start) / overlapDuration,
       mode: newest.c.mode,
     };
   }
@@ -82,24 +88,34 @@ function render(t) {
   if (!TL) return;
   const st = playerState(t);
   const p = st.primary ? st.primary.c : null;
+  const currentTitle = $("cur-title");
+  const incomingTitle = $("incoming-title");
 
-  if (p) {
+  if (st.transition && st.transition.from) {
+    const progress = Math.max(0, Math.min(1, st.transition.progress));
+    const from = st.transition.from;
+    const to = st.transition.to;
+    currentTitle.textContent = clipLabel(from);
+    incomingTitle.textContent = clipLabel(to);
+    currentTitle.style.opacity = `${1 - progress}`;
+    incomingTitle.style.opacity = `${progress}`;
+    currentTitle.style.transform = `translateY(${-5 * progress}px)`;
+    incomingTitle.style.transform = `translateY(${5 * (1 - progress)}px)`;
+    const toTrack = TRACKS[to.track] || {};
+    $("cur-bpm").textContent = `${Math.round(to.bpm || toTrack.bpm || 0)} BPM`;
+  } else if (p) {
     const tr = TRACKS[p.track] || {};
-    $("cur-title").textContent = clipLabel(p);
+    currentTitle.textContent = clipLabel(p);
+    currentTitle.style.opacity = "1";
+    currentTitle.style.transform = "translateY(0)";
+    incomingTitle.textContent = "";
+    incomingTitle.style.opacity = "0";
+    incomingTitle.style.transform = "translateY(5px)";
     $("cur-bpm").textContent = `${Math.round(p.bpm || tr.bpm || 0)} BPM`;
   }
 
   $("prev-title").textContent = clipLabel(st.prev);
   $("next-title").textContent = clipLabel(st.upcoming);
-
-  // Crossfade fill, inline between current and next
-  const xf = $("xfade");
-  if (st.transition) {
-    xf.classList.remove("hidden");
-    const pct = Math.round(st.transition.progress * 100);
-    $("xfade-fill").style.width = `${pct}%`;
-    $("xfade-pct").textContent = `MIXING ${pct}%`;
-  } else xf.classList.add("hidden");
 }
 
 // ── Stereo power meter (Web Audio API) ───────────────────────────────────────

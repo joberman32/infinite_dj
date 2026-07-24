@@ -14,7 +14,7 @@
     </header>
 
     <main id="stage">
-      <!-- Prev / current / next track strip, with an inline crossfade fill -->
+      <!-- Prev / current / next strip; current titles animate through overlaps -->
       <section id="strip">
         <div class="slot prev">
           <div class="slot-label">PREV</div>
@@ -26,10 +26,9 @@
             <span id="cur-tag">NOW</span>
             <span id="cur-bpm"></span>
           </div>
-          <div id="cur-title" class="slot-title">Loading…</div>
-          <div id="xfade" class="xfade hidden">
-            <div class="xfade-track"><div id="xfade-fill"></div></div>
-            <div class="xfade-pct"><span id="xfade-pct">0%</span></div>
+          <div class="title-stack">
+            <div id="cur-title" class="slot-title">Loading…</div>
+            <div id="incoming-title" class="slot-title" aria-hidden="true"></div>
           </div>
         </div>
 
