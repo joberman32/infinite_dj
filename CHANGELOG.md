@@ -4,6 +4,14 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-24 — dBFS stereo meter
+
+- Changed the player meter from amplified linear RMS to a −60–0 dBFS scale.
+  Fixed mixer-style colour zones now mark green below −12 dBFS, yellow from
+  −12 to −6 dBFS, and orange above −6 dBFS. The fill scales over the fixed
+  gradient so the colours represent stable thresholds rather than proportions
+  of the current reading.
+
 ## 2026-07-22 — Interactive web player (MVP, phased)
 
 - Productization MVP: a dependency-free local web player that plays a rendered

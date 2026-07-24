@@ -118,18 +118,24 @@ function rms(analyser, buf) {
   return Math.sqrt(sum / buf.length);
 }
 
+const METER_FLOOR_DB = -60;
+function dbMeterLevel(value) {
+  const db = 20 * Math.log10(Math.max(value, 0.000001));
+  return Math.max(0, Math.min(1, (db - METER_FLOOR_DB) / -METER_FLOOR_DB));
+}
+
 let smoothL = 0, smoothR = 0;
 function updateMeters() {
   let lvL = 0, lvR = 0;
   if (analyserL && analyserR && !audio.paused) {
-    lvL = Math.min(1, rms(analyserL, meterBufL) * 3.2);
-    lvR = Math.min(1, rms(analyserR, meterBufR) * 3.2);
+    lvL = dbMeterLevel(rms(analyserL, meterBufL));
+    lvR = dbMeterLevel(rms(analyserR, meterBufR));
   }
   // Fast attack, slower release, so it reads like a real meter.
   smoothL = lvL > smoothL ? lvL : smoothL * 0.85;
   smoothR = lvR > smoothR ? lvR : smoothR * 0.85;
-  $("meter-l").style.height = `${smoothL * 100}%`;
-  $("meter-r").style.height = `${smoothR * 100}%`;
+  $("meter-l").style.transform = `scaleY(${smoothL})`;
+  $("meter-r").style.transform = `scaleY(${smoothR})`;
   peakL = Math.max(smoothL, peakL - 0.012);
   peakR = Math.max(smoothR, peakR - 0.012);
   $("peak-l").style.bottom = `${peakL * 100}%`;
