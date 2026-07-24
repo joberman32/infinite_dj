@@ -11,6 +11,9 @@ captures constraints that may not be obvious from a local code path.
   −12 to −6 dBFS, and orange above −6 dBFS. The fill scales over the fixed
   gradient so the colours represent stable thresholds rather than proportions
   of the current reading.
+- Prev/now/next identify the exact splice as `track + segment`. Repeated
+  same-named segments receive an occurrence index, and adjacent segments from
+  the same source track are no longer hidden from the previous slot.
 
 ## 2026-07-22 — Interactive web player (MVP, phased)
 

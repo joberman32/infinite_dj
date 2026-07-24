@@ -13,6 +13,18 @@ const fmt = (s) => {
   return `${(s / 60) | 0}:${String(s % 60).padStart(2, "0")}`;
 };
 
+function clipLabel(c) {
+  if (!c) return "—";
+  const title = (TRACKS[c.track] || {}).title || "Unknown track";
+  const section = c.section || "segment";
+  const siblings = TL.clips.filter(
+    (other) => other.track === c.track && (other.section || "segment") === section
+  );
+  if (siblings.length < 2) return `${title} + ${section}`;
+  const occurrence = siblings.indexOf(c) + 1;
+  return `${title} + ${section} ${occurrence}/${siblings.length}`;
+}
+
 // ── PlayerState from clips ───────────────────────────────────────────────────
 function clipGain(c, t) {
   if (t < c.start || t >= c.end) return 0;
@@ -46,11 +58,12 @@ function playerState(t) {
   for (const c of TL.clips)
     if (c.start > t && c.start < best) { best = c.start; upcoming = c; }
   // Previous: the clip that started most recently before the primary clip.
+  // This can be another segment from the same track.
   let prev = null;
   if (primary) {
     let bestStart = -Infinity;
     for (const c of TL.clips)
-      if (c.start < primary.c.start && c.start > bestStart && c.track !== primary.c.track) {
+      if (c.start < primary.c.start && c.start > bestStart) {
         bestStart = c.start; prev = c;
       }
   }
@@ -65,14 +78,12 @@ function render(t) {
 
   if (p) {
     const tr = TRACKS[p.track] || {};
-    $("cur-title").textContent = tr.title || "—";
+    $("cur-title").textContent = clipLabel(p);
     $("cur-bpm").textContent = `${Math.round(p.bpm || tr.bpm || 0)} BPM`;
   }
 
-  const prevTr = st.prev ? (TRACKS[st.prev.track] || {}) : null;
-  $("prev-title").textContent = prevTr ? (prevTr.title || "") : "—";
-  const nextTr = st.upcoming ? (TRACKS[st.upcoming.track] || {}) : null;
-  $("next-title").textContent = nextTr ? (nextTr.title || "") : "—";
+  $("prev-title").textContent = clipLabel(st.prev);
+  $("next-title").textContent = clipLabel(st.upcoming);
 
   // Crossfade fill, inline between current and next
   const xf = $("xfade");
