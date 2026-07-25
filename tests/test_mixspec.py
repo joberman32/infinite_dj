@@ -84,9 +84,16 @@ def test_insane_ignores_pace_and_raw_bounds():
                         "min_sec": 120, "max_sec": 240})
     assert p["seg"] is None                       # Pace deliberately dropped
     assert p["kwargs"]["min_seg_bars"] == 2       # free to sub-segment
-    assert p["kwargs"]["max_seg_bars"] == 32
-    assert p["kwargs"]["layers"] == 4
+    assert p["kwargs"]["max_seg_bars"] <= 12      # splices stay short
+    assert p["kwargs"]["layers"] >= 5             # heavy overlap
+    assert p["kwargs"]["chaos"] == 1.0            # full wildness
     assert p["kwargs"]["seed"] is not None        # fresh every render
+
+
+def test_chaos_rises_with_serendipity():
+    high = resolve_params({"serendipity": "high"})["kwargs"]["chaos"]
+    insane = resolve_params({"serendipity": "insane"})["kwargs"]["chaos"]
+    assert 0 < high < insane == 1.0
 
 
 def test_high_derives_bars_from_pace():

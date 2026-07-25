@@ -145,13 +145,17 @@ def resolve_params(spec: dict) -> dict:
                 "kwargs": {"target_length_sec": length_sec, "layers": 3,
                            "min_seg_bars": max(2, int(lo / _SEC_PER_BAR)),
                            "max_seg_bars": max(4, int(hi / _SEC_PER_BAR)),
+                           "chaos": 0.35,
                            "seed": spec.get("seed")}}
 
-    # insane — Pace is deliberately ignored: sub-segment freely, layer heavily,
-    # and pick a fresh seed every time so no two mixes are alike.
+    # insane — Pace is deliberately ignored. chaos=1 dices sections into
+    # sub-segments, keeps splices very short, shrinks the hop so many layers
+    # sound at once, and alternates contrasting with complementary timbre.
+    # A fresh seed every time so no two mixes are alike.
     return {"renderer": "collage", "seg": None,
-            "kwargs": {"target_length_sec": length_sec, "layers": 4,
-                       "min_seg_bars": 2, "max_seg_bars": 32,
+            "kwargs": {"target_length_sec": length_sec, "layers": 5,
+                       "min_seg_bars": 2, "max_seg_bars": 12,
+                       "chaos": 1.0,
                        "seed": spec.get("seed", random.randint(0, 10 ** 6))}}
 
 

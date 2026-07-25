@@ -528,7 +528,7 @@ def cmd_splice(args):
         audio, sr, markers, clips = render_collage(
             tracks, target_length_sec=target_sec, layers=args.layers,
             min_seg_bars=args.min_seg_bars, max_seg_bars=args.max_seg_bars,
-            seed=args.seed)
+            seed=args.seed, chaos=args.chaos)
     else:
         min_seg, max_seg = args.min_seg, args.max_seg
         if min_seg >= max_seg:
@@ -699,6 +699,9 @@ def main():
                           help="Collage: longest segment in bars (default 24)")
     p_splice.add_argument("--seed", type=int, default=None,
                           help="Collage: random seed for reproducible pacing")
+    p_splice.add_argument("--chaos", type=float, default=0.0,
+                          help="Collage wildness 0..1: shorter splices, more "
+                               "overlap, sub-segments, complementary blends")
     p_splice.add_argument("--arc", default="steady",
                           choices=["peak", "steady", "build", "wave"])
     p_splice.add_argument("--timeline", help="Also write a timeline JSON for the web player")

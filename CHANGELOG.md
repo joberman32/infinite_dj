@@ -4,6 +4,35 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-24 — `chaos`: make INSANE genuinely wild
+
+- `render_collage(chaos=0..1)` is a wildness master. As it rises: weave crowds
+  out the calmer movements, segments shorten, hops shrink (more layers, faster
+  switching), sections get diced, and picks alternate contrast/complement.
+  INSANE sets `chaos=1.0`, `layers=5`, `max_seg_bars=12`; HIGH sets `0.35`.
+  Exposed as `splice --chaos` too. `chaos=0` is byte-identical to before.
+- **Sub-segments** (`_segment_pool`): entries previously landed only at whole
+  structural section *starts* (~5–7/track, ≥8 s), which capped how short a
+  splice could be. Sections are now diced every N bars (≤6 per section so the
+  pool stays tractable); sub-segments inherit the parent's CLAP embedding and
+  label, since near-constant timbre is what defines a section.
+- **Complementary blending**: `pick_contrast` was farthest-only and could never
+  choose textures that sit *together*. Now `pick_next(complement=…)` can rank by
+  CLAP-nearest, and weave alternates between the two as chaos rises. Large diced
+  pools are scored on a random 300-candidate slice to keep picks cheap.
+- **Beat-grid safety (two bugs caught in verification).** Shortening segments
+  initially made layering *worse* (5 → 2): `place()` floored hops at one whole
+  bar, so a 4 s splice could only stack twice. Fractional hops fixed that, but
+  26/33 possible hops then landed at fractional beats (1.33, 1.60 …) — layers
+  off the beat grid, the rhythmic mush this project already fixed once. Hops are
+  now snapped to the shared beat grid, and *only* when sub-bar hops are enabled:
+  a bar is not always an exact 4 sample-beats (e.g. 147.8 BPM), so quantising
+  whole-bar hops would drift. Verified across 128/111.2/147.8 BPM: zero off-beat
+  hops at chaos=1, zero change at chaos=0.
+- Measured (6-track pool, 90 s): chaos 0 → 1 takes avg segment 18.8 s → 4.6 s
+  (min 3.6 s, below the old 8 s section floor — sub-segmentation working), max
+  simultaneous layers 4 → 8, entries/min 7.9 → 39.6, peak 0.95 (no clipping).
+
 ## 2026-07-24 — Studio: setup pane + render-on-demand
 
 - New `dj.py studio` launches a browser app where you pick a track pool and

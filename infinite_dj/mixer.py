@@ -31,7 +31,7 @@ try:
 except ImportError:
     HAS_RUBBERBAND = False
 
-from .models import TrackMeta, CuePoint
+from .models import TrackMeta, CuePoint, Section
 from .harmony import camelot_compatibility
 
 # Full quality SR for output
@@ -707,6 +707,35 @@ def _track_sections(track: TrackMeta, min_len_sec: float = 8.0) -> list:
         or list(track.sections)
 
 
+def _segment_pool(tracks: list, bar: float, sub_bars: Optional[int] = None,
+                  max_subs: int = 6, min_len_sec: float = 8.0) -> list:
+    """
+    Candidate ``(track, section)`` entry points for the collage.
+
+    Normally one per structural section. With `sub_bars`, each section is also
+    diced into sub-segments every `sub_bars` bars (capped at `max_subs` per
+    section so the pool stays tractable), so the mixer can enter *partway
+    through* a section — many more, shorter splices. Sub-segments inherit their
+    parent's CLAP embedding and label: timbre is near-constant inside a section,
+    which is what makes it a section.
+    """
+    pool = []
+    for t in tracks:
+        for s in _track_sections(t, min_len_sec):
+            pool.append((t, s))
+            if not sub_bars:
+                continue
+            step = sub_bars * bar
+            k, made = s.start + step, 0
+            while k + step <= s.end and made < max_subs:
+                pool.append((t, Section(start=round(k, 3), end=s.end,
+                                        label=s.label, energy=s.energy,
+                                        embedding=s.embedding)))
+                k += step
+                made += 1
+    return pool
+
+
 def _track_splice_points(track: TrackMeta, min_len_sec: float = 8.0) -> list:
     """
     Ordered entry points for splicing a track, one per *distinct structural
@@ -1028,6 +1057,7 @@ def render_collage(
     min_seg_bars: int = 8,
     max_seg_bars: int = 24,
     seed: Optional[int] = None,
+    chaos: float = 0.0,
 ) -> tuple:
     """
     Structured, variable-pace overlap-add collage.
@@ -1039,12 +1069,18 @@ def render_collage(
 
       - feature: one track holds, playing several of its own sections contiguously
         in natural time order (reads as the track condensed).
-      - weave:   rapid, heavily-overlapping segments chosen to be TIMBRALLY
-        CONTRASTING (CLAP-farthest) from what's already sounding — contrasting
-        sections auto-mixed to each other, within or across tracks.
+      - weave:   rapid, heavily-overlapping segments chosen by TIMBRE — either
+        CONTRASTING (CLAP-farthest) or COMPLEMENTARY (CLAP-nearest) to what's
+        already sounding, within or across tracks.
       - breathe: a long segment plays mostly alone before the next.
 
-    Returns (audio, sr, [SetMarker, ...]).
+    `chaos` (0..1) is the wildness master. As it rises: weave crowds out the
+    calmer movements, segments get shorter, hops shrink (so more layers sound at
+    once and switching is rapid), sections get diced into sub-segments so the
+    mixer can enter partway through one, and picks alternate between
+    contrasting and complementary timbre instead of always contrasting.
+
+    Returns (audio, sr, [SetMarker, ...], clips).
     """
     import random
     rng = random.Random(seed)
@@ -1086,7 +1122,19 @@ def render_collage(
         env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
         return (seg * env.reshape(-1, 1)).astype(np.float32)
 
-    seg_pool = [(t, s) for t in tracks for s in _track_sections(t)]
+    chaos = float(np.clip(chaos, 0.0, 1.0))
+    # High chaos dices sections so we can enter partway through one, and lowers
+    # the length floor so a splice can be a couple of bars.
+    sub_bars = max(2, int(round(8 - 6 * chaos))) if chaos >= 0.3 else None
+    min_len = 8.0 - 5.0 * chaos
+    # Entries normally advance a whole bar, which keeps every layer's downbeats
+    # on one grid. Very short splices can't stack that way (a 2-bar segment over
+    # a 1-bar hop is only 2 deep), so high chaos allows beat-granular hops:
+    # beats still line up, only the downbeat phase shifts between layers.
+    beat_s = max(1, int(round(bar_s / 4)))
+    sub_beat_hops = chaos >= 0.5
+    hop_floor_s = beat_s if sub_beat_hops else bar_s
+    seg_pool = _segment_pool(tracks, bar, sub_bars=sub_bars, min_len_sec=min_len)
     have_emb = any(s.embedding for _, s in seg_pool)
 
     markers, clips, pos, active, recent = [], [], 0, [], []
@@ -1116,20 +1164,35 @@ def render_collage(
             })
             active.append((section.embedding, pos + len(seg)))
             recent.append(t.file_path)
-        pos += max(bar_s, int(hop_bars) * bar_s)
+        step = max(hop_floor_s, int(round(float(hop_bars) * bar_s)))
+        if sub_beat_hops:
+            # Fractional-bar hops would land layers off-beat against each other,
+            # so snap to the shared beat grid. (Only here: a bar isn't always an
+            # exact 4 sample-beats, so quantising whole-bar hops would drift.)
+            step = max(hop_floor_s, int(round(step / beat_s)) * beat_s)
+        pos += step
 
-    def pick_contrast(last_key):
-        """A (track, section) most timbrally contrasting to what's sounding now."""
+    def pick_next(last_key, complement=False):
+        """
+        A (track, section) to layer next, chosen by timbre against what's
+        already sounding: `complement=True` picks the CLAP-nearest (textures
+        that sit together), otherwise the CLAP-farthest (deliberate contrast).
+        """
         prune()
         act = [e for (e, _) in active if e is not None]
         cands = [ts for ts in seg_pool if ts[0].file_path not in recent[-2:]] or seg_pool
+        # Diced pools get large; scoring a random slice keeps picks cheap and
+        # adds variety without changing the character of the choice.
+        if len(cands) > 300:
+            cands = rng.sample(cands, 300)
         if have_emb and act:
-            ranked = sorted(
-                cands,
-                key=lambda ts: max(_clap_cos(ts[1].embedding, e) for e in act)
-                if ts[1].embedding else 1.0)
+            def sim(ts):
+                if not ts[1].embedding:
+                    return 0.0 if complement else 1.0      # unknown ranks last
+                return max(_clap_cos(ts[1].embedding, e) for e in act)
+            ranked = sorted(cands, key=sim, reverse=complement)
             top = ranked[:6]
-            if last_key:  # among the most-contrasting, favour harmonic fit
+            if last_key:  # among the best timbre matches, favour harmonic fit
                 top.sort(key=lambda ts: -camelot_compatibility(last_key, ts[0].key))
             return top[0]
         return rng.choice(cands)
@@ -1139,9 +1202,10 @@ def render_collage(
         guard += 1
         prune()
         progress = pos / total_s
-        w_weave   = 1.5 + (1.5 if 0.2 <= progress <= 0.85 else 0.0)
-        w_feature = 1.2
-        w_breathe = 1.0 + (1.5 if (progress < 0.2 or progress > 0.85) else 0.0)
+        calm = 1.0 - 0.85 * chaos          # chaos crowds out the calm movements
+        w_weave   = 1.5 + (1.5 if 0.2 <= progress <= 0.85 else 0.0) + 5.0 * chaos
+        w_feature = 1.2 * calm
+        w_breathe = (1.0 + (1.5 if (progress < 0.2 or progress > 0.85) else 0.0)) * calm
         mode = rng.choices(["weave", "feature", "breathe"],
                            weights=[w_weave, w_feature, w_breathe])[0]
 
@@ -1163,19 +1227,27 @@ def render_collage(
 
         elif mode == "weave":
             last_key = None
-            for _ in range(rng.randint(3, 6)):
-                t, s = pick_contrast(last_key)
+            # Longer weave runs and shorter segments as chaos rises.
+            runs = rng.randint(3, 6 + int(8 * chaos))
+            hi_bars = max(min_seg_bars,
+                          int(((min_seg_bars + max_seg_bars) // 2) * (1.0 - 0.6 * chaos)))
+            # More simultaneous layers => hop is a smaller slice of the segment.
+            divisor = max(1, layers) + int(round(2 * chaos))
+            for _ in range(runs):
+                # Alternate contrast with complementary blends as chaos rises.
+                t, s = pick_next(last_key, complement=rng.random() < 0.5 * chaos)
                 last_key = t.key
-                seg_bars = rng.randint(min_seg_bars, (min_seg_bars + max_seg_bars) // 2)
-                # Heavy overlap: hop is a fraction of the segment (up to `layers`).
+                seg_bars = rng.randint(min_seg_bars, hi_bars)
+                # Fractional hop: on short splices an integer bar hop would
+                # floor to 1 and cap the stack depth regardless of `divisor`.
                 place(t, s, seg_bars, fade_bars=max(2, seg_bars // 2), mode="weave",
-                      hop_bars=max(1, seg_bars // max(1, layers)))
+                      hop_bars=max(0.25, seg_bars / divisor))
                 if pos >= total_s:
                     break
 
         else:  # breathe
             for _ in range(rng.randint(1, 2)):
-                t, s = pick_contrast(None)
+                t, s = pick_next(None)
                 seg_bars = rng.randint((min_seg_bars + max_seg_bars) // 2, max_seg_bars)
                 place(t, s, seg_bars, fade_bars=max(2, seg_bars // 4), mode="breathe",
                       hop_bars=max(1, seg_bars - 1))  # minimal overlap

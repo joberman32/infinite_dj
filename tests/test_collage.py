@@ -44,3 +44,26 @@ def test_splice_points_are_farthest_first_by_clap():
     assert order[0] == strong.start          # strongest first
     assert order[1] == ortho.start           # most contrasting next
     assert order[2] == dup.start             # near-duplicate last
+
+
+def test_segment_pool_subdivides_sections():
+    from infinite_dj.mixer import _segment_pool
+    # One long section: without dicing there's a single entry point; with
+    # sub_bars the mixer can also enter partway through it.
+    secs = [_section(0, 120, "peak", 0.8)]
+    t = _track(secs)
+    bar = 1.875
+    whole = _segment_pool([t], bar, sub_bars=None)
+    diced = _segment_pool([t], bar, sub_bars=4)
+    assert len(whole) == 1
+    assert len(diced) > len(whole)
+    starts = [s.start for _, s in diced]
+    assert starts[0] == 0 and max(starts) > 0        # entries inside the section
+    assert all(s.label == "peak" for _, s in diced)  # inherits parent metadata
+
+
+def test_segment_pool_caps_subdivisions_per_section():
+    from infinite_dj.mixer import _segment_pool
+    t = _track([_section(0, 1000, "peak", 0.8)])
+    diced = _segment_pool([t], 1.875, sub_bars=2, max_subs=6)
+    assert len(diced) == 7          # the section itself + 6 sub-segments
