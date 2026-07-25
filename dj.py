@@ -420,6 +420,31 @@ def _write_and_maybe_serve(args, tracks, clips, audio_path, duration, sr):
         _serve(audio_path, tl_path, getattr(args, "port", 8765))
 
 
+def cmd_studio(args):
+    """
+    Launch the studio: a setup pane to pick tracks and dial in the mix, which
+    renders on demand and hands off to the player.
+    """
+    import tempfile
+    from infinite_dj.webserver import serve_app
+
+    if not os.path.isfile(args.db):
+        print(f"Database not found: {args.db}\nRun `analyze` first.")
+        return
+
+    out_dir = args.out_dir or os.path.join(tempfile.gettempdir(), "infinite_dj_mixes")
+    os.makedirs(out_dir, exist_ok=True)
+
+    httpd, url = serve_app(args.db, out_dir, port=args.port)
+    print(f"\n  ▶ Studio running at {url}   (Ctrl+C to stop)")
+    print(f"    Renders are written to {out_dir}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Studio stopped.")
+        httpd.shutdown()
+
+
 def cmd_serve(args):
     """Serve the local web player for an already-rendered audio + timeline."""
     if not os.path.isfile(args.audio):
@@ -681,6 +706,13 @@ def main():
                           help="Launch the interactive web player after rendering")
     p_splice.add_argument("--port", type=int, default=8765, help="Player port (default 8765)")
 
+    # studio
+    p_studio = sub.add_parser("studio",
+                              help="Launch the studio: pick tracks, set the vibe, generate a mix")
+    p_studio.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
+    p_studio.add_argument("--out-dir", dest="out_dir",
+                          help="Where rendered mixes are written (default: temp dir)")
+
     # serve
     p_serve = sub.add_parser("serve", help="Launch the web player for a rendered set")
     p_serve.add_argument("--audio", required=True, help="Rendered audio file")
@@ -709,6 +741,7 @@ def main():
         "sequence":   cmd_sequence,
         "render-set": cmd_render_set,
         "splice":     cmd_splice,
+        "studio":     cmd_studio,
         "serve":      cmd_serve,
         "play":       cmd_play,
     }

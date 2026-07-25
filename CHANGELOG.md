@@ -4,6 +4,33 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-24 — Studio: setup pane + render-on-demand
+
+- New `dj.py studio` launches a browser app where you pick a track pool and
+  dial in the mix, then generate it — no CLI flags required.
+- **Two axes, not three.** The brainstormed "segmentation high/low" and "raw
+  min/max play time" are the same axis at different abstraction levels, so they
+  ship as one **Pace** control (preset + optional raw override).
+  **Serendipity** (low/medium/high/insane) is the master: it selects the
+  renderer and, at `insane`, deliberately supersedes Pace.
+- `infinite_dj/mixspec.py`: `library_groups` (artist→album→track, from the
+  folder `"Artist - Album"` or falling back to the filename for slug folders)
+  and `resolve_params`/`render_from_spec` — the single mapping from UI spec to
+  `render_set`/`render_collage` arguments, unit-tested without touching audio.
+- `webserver.py` is now an app: `/api/library`, `POST /api/render` (background
+  thread + job registry), `/api/render?job=`, and job-scoped `/audio?job=` /
+  `/timeline.json?job=`. `serve --audio` still works — it pre-seeds a "default"
+  job, so the player's job-less requests resolve unchanged.
+- `webplayer/setup.{html,css,js}` in the same B&W monospace language;
+  `index.html` → `player.html`; `player.js` reads `?job=`.
+- **Known behavior:** at LOW the length is a target, not a cap — full-set mode
+  plays to genuine structural exit cues, so a 3-minute request rounds up to the
+  nearest whole musical spans (~8 min on this library, where cues sit ~2 min
+  apart). Fixed along the way: LOW previously ignored length entirely and
+  rendered the whole library (4287 s for a 180 s request).
+- Deferred: variable/nonlinear crossfade DSP (phase 2) and the live
+  engine + "Next"/look-ahead over a websocket (phase 3).
+
 ## 2026-07-24 — dBFS stereo meter
 
 - Changed the player meter from amplified linear RMS to a −60–0 dBFS scale.

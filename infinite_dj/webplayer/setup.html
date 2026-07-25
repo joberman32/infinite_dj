@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Infinite DJ — Studio</title>
+  <link rel="stylesheet" href="/setup.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">◉ INFINITE_DJ</div>
+      <div id="poolcount" class="dim">—</div>
+    </header>
+
+    <main id="stage">
+      <!-- Library selection -->
+      <section class="block">
+        <div class="block-head">
+          <div class="block-title">LIBRARY</div>
+          <div class="block-actions">
+            <button id="select-all" class="link">ALL</button>
+            <button id="select-none" class="link">NONE</button>
+          </div>
+        </div>
+        <div id="library" class="library"><div class="dim">Loading library…</div></div>
+      </section>
+
+      <!-- Mix parameters -->
+      <section class="block">
+        <div class="block-head"><div class="block-title">SERENDIPITY</div></div>
+        <div id="serendipity" class="seg" role="radiogroup">
+          <button data-v="low">LOW</button>
+          <button data-v="medium" class="on">MEDIUM</button>
+          <button data-v="high">HIGH</button>
+          <button data-v="insane">INSANE</button>
+        </div>
+        <div id="ser-help" class="help dim"></div>
+      </section>
+
+      <section class="block" id="pace-block">
+        <div class="block-head">
+          <div class="block-title">PACE</div>
+          <button id="adv-toggle" class="link">ADVANCED</button>
+        </div>
+        <div id="pace" class="seg" role="radiogroup"></div>
+        <div id="advanced" class="advanced hidden">
+          <label>MIN <input id="min-sec" type="number" min="4" step="1" placeholder="sec" /></label>
+          <label>MAX <input id="max-sec" type="number" min="8" step="1" placeholder="sec" /></label>
+        </div>
+        <div id="pace-note" class="help dim hidden">Ignored at INSANE — the mixer roams freely.</div>
+      </section>
+
+      <section class="block">
+        <div class="block-head"><div class="block-title">LENGTH</div></div>
+        <div class="lenrow">
+          <input id="length" type="number" min="1" max="90" step="1" value="8" />
+          <span class="dim">minutes</span>
+        </div>
+      </section>
+    </main>
+
+    <footer id="actions">
+      <button id="generate">GENERATE MIX</button>
+      <div id="status" class="dim"></div>
+    </footer>
+  </div>
+
+  <script src="/setup.js"></script>
+</body>
+</html>

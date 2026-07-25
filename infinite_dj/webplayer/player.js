@@ -205,7 +205,13 @@ $("scrub").onclick = (e) => {
 };
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
-fetch("/timeline.json").then((r) => r.json()).then((data) => {
+// A studio-rendered mix is addressed by ?job=<id>; without one the server
+// serves the single pre-rendered mix (the `dj.py serve` path).
+const jobParam = new URLSearchParams(location.search).get("job");
+const jobQuery = jobParam ? `?job=${encodeURIComponent(jobParam)}` : "";
+audio.src = `/audio${jobQuery}`;
+
+fetch(`/timeline.json${jobQuery}`).then((r) => r.json()).then((data) => {
   TL = data; TRACKS = data.tracks || {};
   $("dur").textContent = fmt(data.duration);
   loop();  // render once immediately; setInterval keeps it live
