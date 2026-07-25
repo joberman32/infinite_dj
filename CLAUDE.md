@@ -46,7 +46,7 @@ python dj.py --db custom.db <command>   # override default DB path (infinite_dj.
 | `render-set --out file.wav [--n N] [--arc ...]` | Render a full set offline |
 | `splice --out file.wav [--length MIN] [--min-seg S] [--max-seg S] [--layers N] [--arc ...]` | Collage set: sequential splices, or `--layers N` for a structured overlap-add collage (feature/weave/breathe) |
 | `render-set`/`splice --serve [--port N]` | Render then launch the interactive web player; `--timeline PATH` also writes the timeline JSON |
-| `studio [--port N] [--out-dir DIR]` | Launch the studio: pick tracks/albums, set Serendipity + Pace + length, generate a mix, play it |
+| `studio [--port N] [--out-dir DIR]` | Launch the studio: pick tracks/albums, set Serendipity + Pace, then either generate a fixed-length mix or start **RADIO** (endless, plays until you hit EXIT) |
 | `serve --audio file.wav [--timeline JSON] [--port N]` | Launch the web player for an already-rendered set |
 | `play [--start title] [--arc ...] [--out file.wav] [--duration N]` | Real-time playback |
 

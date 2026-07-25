@@ -87,3 +87,13 @@ body {
 #scrub-head { position: absolute; top: 50%; left: 0; width: 8px; height: 8px;
   background: var(--fg); transform: translate(-50%,-50%); }
 .ttime { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 40px; text-align: right; font-size: 12px; }
+
+/* Radio: no duration and nothing to seek, so the scrubber gives way to a live
+   badge and an exit. */
+#livetag, #exitbtn { display: none; }
+.livetag { color: var(--fg); font-size: 11px; letter-spacing: .16em; flex: 1; }
+#exitbtn { background: var(--bg); color: var(--dim); border: 1px solid var(--line2);
+  cursor: pointer; font: inherit; font-size: 11px; letter-spacing: .12em; padding: 10px 14px; }
+#exitbtn:hover { color: var(--fg); border-color: var(--fg); }
+body.radio #scrub { display: none; }
+body.radio #livetag, body.radio #exitbtn { display: block; }

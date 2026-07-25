@@ -54,8 +54,15 @@
       <section class="block">
         <div class="block-head"><div class="block-title">LENGTH</div></div>
         <div class="lenrow">
+          <div id="radio-toggle" class="seg">
+            <button data-v="fixed" class="on">FIXED</button>
+            <button data-v="radio">RADIO</button>
+          </div>
           <input id="length" type="number" min="1" max="90" step="1" value="8" />
-          <span class="dim">minutes</span>
+          <span id="length-unit" class="dim">minutes</span>
+        </div>
+        <div id="radio-note" class="help dim hidden">
+          Endless — the engine keeps mixing until you exit.
         </div>
       </section>
     </main>

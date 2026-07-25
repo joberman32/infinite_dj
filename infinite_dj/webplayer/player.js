@@ -118,27 +118,35 @@ function render(t) {
   $("next-title").textContent = clipLabel(st.upcoming);
 }
 
-// ── Stereo power meter (Web Audio API) ───────────────────────────────────────
-let actx = null, analyserL = null, analyserR = null, meterBufL = null, meterBufR = null;
+// ── Audio graph + stereo power meter (Web Audio API) ─────────────────────────
+// Everything audible runs through one `bus`, so the meters read the same signal
+// whether it comes from the <audio> element (a finished mix) or from scheduled
+// buffers (radio). A growing stream can't be fed through <audio>/MSE, hence the
+// two sources.
+let actx = null, bus = null, analyserL = null, analyserR = null;
+let meterBufL = null, meterBufR = null;
 let peakL = 0, peakR = 0;
 
-function ensureMeterGraph() {
-  if (actx) return;
+function ensureAudioGraph(connectElement) {
+  if (actx) return true;
   try {
     actx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = actx.createMediaElementSource(audio);
-    src.connect(actx.destination);           // keep audio audible
+    bus = actx.createGain();
+    bus.connect(actx.destination);
     const splitter = actx.createChannelSplitter(2);
-    src.connect(splitter);
+    bus.connect(splitter);
     analyserL = actx.createAnalyser(); analyserL.fftSize = 512;
     analyserR = actx.createAnalyser(); analyserR.fftSize = 512;
     splitter.connect(analyserL, 0);
     splitter.connect(analyserR, 1);
     meterBufL = new Uint8Array(analyserL.fftSize);
     meterBufR = new Uint8Array(analyserR.fftSize);
+    if (connectElement) actx.createMediaElementSource(audio).connect(bus);
+    return true;
   } catch (e) {
-    console.warn("Stereo meter unavailable:", e);
+    console.warn("Audio graph unavailable:", e);
     actx = null;
+    return false;
   }
 }
 
@@ -158,10 +166,59 @@ function dbMeterLevel(value) {
   return Math.max(0, Math.min(1, (db - METER_FLOOR_DB) / -METER_FLOOR_DB));
 }
 
+// ── Radio: schedule rendered chunks back-to-back on the AudioContext clock ───
+const RADIO = new URLSearchParams(location.search).get("radio") === "1";
+const radio = { t0: null, nextIdx: 0, nextAt: 0, chunks: [], playing: false };
+
+function radioTime() {
+  if (!actx || radio.t0 === null) return 0;
+  return Math.max(0, actx.currentTime - radio.t0);
+}
+
+async function radioPoll() {
+  if (!RADIO || !jobParam) return;
+  try {
+    const s = await (await fetch(`/api/radio/state?job=${jobParam}`)).json();
+    if (s.error) { $("cur-title").textContent = s.error; return; }
+    TL = { clips: s.clips || [], tracks: s.tracks || {}, duration: s.generated_sec };
+    TRACKS = TL.tracks;
+    radio.chunks = s.chunks || [];
+    $("dur").textContent = "LIVE";
+    scheduleAhead();
+  } catch (e) { /* transient — the next poll retries */ }
+}
+
+async function scheduleAhead() {
+  if (!RADIO || !radio.playing || !actx) return;
+  // Keep roughly 30s queued ahead of the clock; each chunk is decoded and
+  // started exactly where the previous one ends, so seams are sample-accurate.
+  while (radio.nextIdx < radio.chunks.length &&
+         radio.nextAt - actx.currentTime < 30) {
+    const i = radio.nextIdx;
+    try {
+      const res = await fetch(`/api/radio/chunk?job=${jobParam}&i=${i}`);
+      const buf = await actx.decodeAudioData(await res.arrayBuffer());
+      const src = actx.createBufferSource();
+      src.buffer = buf;
+      src.connect(bus);
+      const when = Math.max(actx.currentTime + 0.08, radio.nextAt);
+      src.start(when);
+      if (radio.t0 === null) radio.t0 = when;
+      radio.nextAt = when + buf.duration;
+      radio.nextIdx = i + 1;
+    } catch (e) {
+      console.warn("chunk", i, e);
+      break;
+    }
+  }
+}
+
 let smoothL = 0, smoothR = 0;
 function updateMeters() {
   let lvL = 0, lvR = 0;
-  if (analyserL && analyserR && !audio.paused) {
+  const live = RADIO ? (radio.playing && actx && actx.state === "running")
+                     : !audio.paused;
+  if (analyserL && analyserR && live) {
     lvL = dbMeterLevel(rms(analyserL, meterBufL));
     lvR = dbMeterLevel(rms(analyserR, meterBufR));
   }
@@ -178,12 +235,14 @@ function updateMeters() {
 
 // ── Transport ────────────────────────────────────────────────────────────────
 function loop() {
-  const t = audio.currentTime;
+  const t = RADIO ? radioTime() : audio.currentTime;
   $("pos").textContent = fmt(t);
   $("ttime").textContent = fmt(t);
-  const frac = TL ? Math.min(1, t / (TL.duration || audio.duration || 1)) : 0;
-  $("scrub-fill").style.width = `${frac * 100}%`;
-  $("scrub-head").style.left = `${frac * 100}%`;
+  if (!RADIO) {
+    const frac = TL ? Math.min(1, t / (TL.duration || audio.duration || 1)) : 0;
+    $("scrub-fill").style.width = `${frac * 100}%`;
+    $("scrub-head").style.left = `${frac * 100}%`;
+  }
   render(t);
   updateMeters();
 }
@@ -191,10 +250,31 @@ function loop() {
 // on hidden/background tabs (freezing the meters); a 30fps interval keeps the
 // live meters and clock running whenever the player is playing.
 setInterval(loop, 33);
-$("playbtn").onclick = () => {
-  ensureMeterGraph();
+$("playbtn").onclick = async () => {
+  if (RADIO) {
+    if (!ensureAudioGraph(false)) return;
+    if (!radio.playing) {
+      radio.playing = true;
+      $("playbtn").textContent = "❚❚";
+      await actx.resume();
+      scheduleAhead();
+    } else if (actx.state === "running") {
+      await actx.suspend();                 // pause: the clock stops with it
+      $("playbtn").textContent = "▶";
+    } else {
+      await actx.resume();
+      $("playbtn").textContent = "❚❚";
+    }
+    return;
+  }
+  ensureAudioGraph(true);
   if (actx && actx.state === "suspended") actx.resume();
   audio.paused ? audio.play() : audio.pause();
+};
+$("exitbtn").onclick = async () => {
+  try { await fetch(`/api/radio/stop?job=${jobParam}`, { method: "POST" }); }
+  catch (e) { /* leaving anyway */ }
+  window.location = "/";
 };
 audio.addEventListener("play", () => $("playbtn").textContent = "❚❚");
 audio.addEventListener("pause", () => $("playbtn").textContent = "▶");
@@ -209,10 +289,18 @@ $("scrub").onclick = (e) => {
 // serves the single pre-rendered mix (the `dj.py serve` path).
 const jobParam = new URLSearchParams(location.search).get("job");
 const jobQuery = jobParam ? `?job=${encodeURIComponent(jobParam)}` : "";
-audio.src = `/audio${jobQuery}`;
 
-fetch(`/timeline.json${jobQuery}`).then((r) => r.json()).then((data) => {
-  TL = data; TRACKS = data.tracks || {};
-  $("dur").textContent = fmt(data.duration);
-  loop();  // render once immediately; setInterval keeps it live
-}).catch((e) => { $("cur-title").textContent = "Failed to load timeline"; console.error(e); });
+if (RADIO) {
+  // Endless mix: no duration and nothing to seek, so the scrubber gives way to
+  // a live badge and an exit.
+  document.body.classList.add("radio");
+  radioPoll();
+  setInterval(radioPoll, 2000);
+} else {
+  audio.src = `/audio${jobQuery}`;
+  fetch(`/timeline.json${jobQuery}`).then((r) => r.json()).then((data) => {
+    TL = data; TRACKS = data.tracks || {};
+    $("dur").textContent = fmt(data.duration);
+    loop();  // render once immediately; setInterval keeps it live
+  }).catch((e) => { $("cur-title").textContent = "Failed to load timeline"; console.error(e); });
+}

@@ -33,6 +33,33 @@ captures constraints that may not be obvious from a local code path.
   (min 3.6 s, below the old 8 s section floor — sub-segmentation working), max
   simultaneous layers 4 → 8, entries/min 7.9 → 39.6, peak 0.95 (no clipping).
 
+## 2026-07-24 — Radio mode: endless, continuously-rendered mixes
+
+- `RADIO` in the studio starts an endless mix instead of a fixed-length render.
+  It primes a few seconds so playback starts almost immediately, then a
+  background thread keeps extending the collage until you hit EXIT.
+- **What made it possible** was the stretch-on-demand work (see above): renders
+  now run 20–45x faster than playback, so the buffer races ahead of the
+  listener. Measured over HTTP: prime 0.37s → 30s of audio ready (gate ≤3s),
+  140s buffered within 6s of wall time.
+- `render_collage(state=...)` is resumable; `RadioSession` (`radio.py`) drives
+  it, emitting finalised audio as 10s WAV chunks and idling once ~4 minutes
+  ahead. Endpoints: `POST /api/radio`, `GET /api/radio/state`,
+  `GET /api/radio/chunk`, `POST /api/radio/stop`.
+- A growing stream can't go through `<audio>`/MSE, so the player schedules
+  decoded chunks on the AudioContext clock, each starting exactly where the last
+  ends. Both playback paths now share one `bus` → analysers, so the stereo
+  meters work unchanged. The playhead is `actx.currentTime`, which means
+  `suspend()` pauses the clock for free.
+- Radio has no duration or seek: the scrubber gives way to a LIVE badge and
+  EXIT (stops the session and deletes its chunks). Verified in-browser: 26s
+  spanning 3 chunk seams with **zero** silent samples, meters live, PREV/NOW/NEXT
+  updating, no console errors, clean EXIT with no files left behind.
+- `mixspec.radio_profile(level)` shapes character per level rather than
+  switching renderers (`render_set` has no resumable form), so LOW radio
+  *approximates* — does not replicate — offline LOW. INSANE is bracketed:
+  its bottleneck is CLAP candidate scoring, not rendering.
+
 ## 2026-07-24 — Studio: setup pane + render-on-demand
 
 - New `dj.py studio` launches a browser app where you pick a track pool and

@@ -96,6 +96,9 @@ function applySerendipity(v) {
   $("pace-note").classList.toggle("hidden", !insane);
   if (insane) $("advanced").classList.add("hidden");
   ["min-sec", "max-sec"].forEach((id) => { $(id).disabled = insane; });
+  // Radio is bracketed at INSANE (its cost is CLAP scoring, not rendering).
+  $("radio-toggle").classList.toggle("disabled", insane);
+  if (insane && typeof applyRadio === "function") applyRadio(false);
 }
 $("serendipity").addEventListener("click", (e) => {
   const b = e.target.closest("button"); if (b) applySerendipity(b.dataset.v);
@@ -111,6 +114,24 @@ $("pace").addEventListener("click", (e) => {
   [...$("pace").children].forEach((x) => x.classList.toggle("on", x.dataset.v === pace));
 });
 $("adv-toggle").onclick = () => $("advanced").classList.toggle("hidden");
+
+// Radio: endless instead of a fixed length. Bracketed at INSANE for now.
+let radioMode = false;
+function applyRadio(on) {
+  radioMode = on && serendipity !== "insane";
+  [...$("radio-toggle").children].forEach(
+    (b) => b.classList.toggle("on", (b.dataset.v === "radio") === radioMode));
+  $("length").classList.toggle("hidden", radioMode);
+  $("length-unit").classList.toggle("hidden", radioMode);
+  $("radio-note").classList.toggle("hidden", !radioMode);
+  $("generate").textContent = radioMode ? "START RADIO" : "GENERATE MIX";
+}
+$("radio-toggle").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.v === "radio" && serendipity === "insane") return;  // bracketed
+  applyRadio(b.dataset.v === "radio");
+});
 
 // ── Generate ─────────────────────────────────────────────────────────────────
 function spec() {
@@ -130,14 +151,19 @@ function spec() {
 $("generate").onclick = async () => {
   if (selected.size < 2) return;
   $("generate").disabled = true;
-  $("status").textContent = "generating…";
+  $("status").textContent = radioMode ? "starting radio…" : "generating…";
   try {
-    const r = await fetch("/api/render", {
+    const r = await fetch(radioMode ? "/api/radio" : "/api/render", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(spec()),
     });
     const { job, error } = await r.json();
     if (error) throw new Error(error);
+    if (radioMode) {
+      // Radio primes before responding, so it's ready to play right away.
+      window.location = `/player?job=${job}&radio=1`;
+      return;
+    }
     poll(job);
   } catch (e) {
     $("status").textContent = `error: ${e.message}`;
@@ -174,6 +200,7 @@ fetch("/api/library").then((r) => r.json()).then((data) => {
   LIB.forEach((a) => artistIds(a).forEach((id) => selected.add(id)));   // start with all
   buildPace(data.pace_presets || ["flowing"]);
   applySerendipity(serendipity);
+  applyRadio(false);
   renderLibrary();
 }).catch((e) => {
   $("library").innerHTML = `<div class="dim" style="padding:12px">Failed to load library: ${e.message}</div>`;

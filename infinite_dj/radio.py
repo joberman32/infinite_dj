@@ -139,19 +139,28 @@ class RadioSession:
     # ── reads for the web layer ──────────────────────────────────────────────
 
     def state(self) -> dict:
+        from .timeline import build_timeline
         with self._lock:
-            return {
-                "job": self.job_id,
-                "ready": bool(self.chunks),
-                "sr": self.sr,
-                "chunk_sec": CHUNK_SEC,
-                "generated_sec": round(self._generated, 3),
-                "chunks": [{"i": c["i"], "start": c["start"], "dur": c["dur"]}
-                           for c in self.chunks],
-                "clips": list(self.clips),
-                "stopped": self._stop.is_set(),
-                "error": self.error,
-            }
+            clips = list(self.clips)
+            chunks = [{"i": c["i"], "start": c["start"], "dur": c["dur"]}
+                      for c in self.chunks]
+            generated = self._generated
+            err = self.error
+        # Same shape the player already consumes for a finished mix, so the
+        # dashboard's labels and crossfade animation work unchanged.
+        tl = build_timeline(clips, self.tracks, generated, self.sr)
+        return {
+            "job": self.job_id,
+            "ready": bool(chunks),
+            "sr": self.sr,
+            "chunk_sec": CHUNK_SEC,
+            "generated_sec": round(generated, 3),
+            "chunks": chunks,
+            "clips": tl["clips"],
+            "tracks": tl["tracks"],
+            "stopped": self._stop.is_set(),
+            "error": err,
+        }
 
     def chunk_path(self, index: int) -> Optional[str]:
         with self._lock:
