@@ -1222,7 +1222,14 @@ def render_collage(
         """Overlap-add one segment at `pos`, log it, advance `pos` by hop_bars."""
         nonlocal pos
         prune()
-        lock = len(active) > 0        # something is sounding -> must beat-lock
+        # Lock only when the overlap is *material*. A feature/breathe hop leaves
+        # a 1-2 bar join at the end of a 70-bar segment; stretching the whole
+        # segment to beat-lock 3% of it is exactly the waste that "only stretch
+        # when transitioning" is meant to avoid — a brief join crossfades fine
+        # at native tempo. A weave hop overlaps ~80% and does need locking.
+        overlap = max([e for (_, e) in active], default=pos) - pos
+        est_len = max(1, int(seg_bars) * ref["bar_s"])
+        lock = overlap > 0.25 * est_len
         got = emit(t, section, seg_bars, fade_bars, lock)
         seg, eff, was_stretched, fade_sec = got if got else (None, 0.0, False, 0.0)
         end = min(pos + len(seg), len(master)) if seg is not None else pos

@@ -55,6 +55,12 @@ captures constraints that may not be obvious from a local code path.
   EXIT (stops the session and deletes its chunks). Verified in-browser: 26s
   spanning 3 chunk seams with **zero** silent samples, meters live, PREV/NOW/NEXT
   updating, no console errors, clean EXIT with no files left behind.
+- **Only stretch on a *material* overlap.** Locking on any overlap at all meant
+  a 1-2 bar join at the end of a 70-bar segment forced the whole segment to be
+  stretched — 67% of LOW segments, the exact waste the change was meant to
+  remove. Locking only above a 25% overlap took LOW to **0% stretched and 65.6x
+  realtime** (from 67% / 13.6x); HIGH 71% -> 33% and 11.6x -> 20.1x. LOW radio
+  now plays entirely at native tempo: faster *and* higher fidelity.
 - `mixspec.radio_profile(level)` shapes character per level rather than
   switching renderers (`render_set` has no resumable form), so LOW radio
   *approximates* — does not replicate — offline LOW. INSANE is bracketed:
