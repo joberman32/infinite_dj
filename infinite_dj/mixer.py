@@ -1092,35 +1092,85 @@ def render_collage(
     bar     = (60.0 / set_bpm) * 4
     bar_s   = _time_to_samples(bar, sr)
     total_s = _time_to_samples(target_length_sec, sr)
-    master  = np.zeros((total_s + max_seg_bars * bar_s + sr, 2), dtype=np.float32)
+    # Generous tail: a segment played at a slow native tempo runs longer than
+    # the same bar count on the median-tempo grid.
+    master  = np.zeros((total_s + max_seg_bars * bar_s * 3 + sr, 2), dtype=np.float32)
 
-    # Stretch each track to the set tempo once, then reuse (fast repeated splices).
+    # Decode + loudness-match once per track, at its NATIVE tempo. Stretching is
+    # per-segment and only happens when a segment has to beat-lock to audio
+    # that's already sounding (see `emit`) — stretching whole tracks up front
+    # cost ~9.6s each and dragged every track to one median tempo.
     cache = {}
     def get_track(t):
         if t.file_path not in cache:
             audio, _ = _load_audio(t.file_path, sr)
             audio = _loudness_match(audio, t.loudness, MASTER_LOUDNESS)
-            ratio = min([set_bpm / t.bpm, set_bpm / (t.bpm * 2.0), set_bpm / (t.bpm / 2.0)],
-                        key=lambda r: abs(r - 1.0))
-            if abs(ratio - 1.0) > 0.001:
-                audio = _time_stretch(audio, sr, ratio)
-            cache[t.file_path] = (audio, [d / ratio for d in t.downbeats], ratio)
+            cache[t.file_path] = (audio, list(t.downbeats))
         return cache[t.file_path]
 
-    def emit(t, section, seg_bars, fade_bars):
-        """Extract a beat-aligned, equal-power-faded segment; None if too short."""
-        audio, downs, ratio = get_track(t)
-        entry = _find_nearest_downbeat(section.start / ratio, downs, max_offset=bar / 2.0)
+    stretch_cache: dict = {}
+    def _stretched(path, audio, start, n, ratio):
+        """Stretch one slice, memoised — repeats are common in a long session."""
+        key = (path, start, n, round(ratio, 4))
+        got = stretch_cache.get(key)
+        if got is None:
+            got = _time_stretch(audio[start:start + n], sr, ratio)
+            if len(stretch_cache) < 256:
+                stretch_cache[key] = got
+        return got
+
+    # Tempo the next overlapping segment must lock to. A segment entering alone
+    # plays native and becomes the new reference — what a DJ actually does.
+    ref = {"bpm": set_bpm, "bar_s": bar_s}
+    stats = {"stretched": 0, "native": 0}
+
+    def _eff_bpm(t, target):
+        """The track's tempo folded by half/double toward `target`."""
+        return min((t.bpm, t.bpm * 2.0, t.bpm / 2.0),
+                   key=lambda b: abs(target / b - 1.0))
+
+    def emit(t, section, seg_bars, fade_bars, lock):
+        """
+        Slice `seg_bars` bars at the track's native tempo. When `lock`, stretch
+        that slice to the reference tempo so it beat-locks with what's already
+        sounding; otherwise let it play native (far cheaper, and unmangled).
+        Returns (audio, eff_bpm, stretched, fade_sec) or None.
+        """
+        audio, downs = get_track(t)
+        eff = _eff_bpm(t, ref["bpm"])
+        nat_bar = (60.0 / eff) * 4
+        nat_bar_s = _time_to_samples(nat_bar, sr)
+        entry = _find_nearest_downbeat(section.start, downs, max_offset=nat_bar / 2.0)
         es = _time_to_samples(entry, sr)
-        seg = audio[es: es + int(seg_bars) * bar_s]
-        if len(seg) < bar_s:
+        # Clamp to what's left of the track rather than rejecting: a rejected
+        # placement would leave a hole, since `pos` advances regardless.
+        avail = len(audio) - es
+        if avail < nat_bar_s:
             return None
+        n_native = min(int(seg_bars) * nat_bar_s, avail)
+
+        ratio = ref["bpm"] / eff
+        # Skip the stretch when the drift across this segment is imperceptible
+        # (well under a 16th note) — Rubber Band is a subprocess, so not calling
+        # it is the cheapest optimisation available.
+        drift = (n_native / sr) * abs(ratio - 1.0)
+        if lock and drift > 0.025:
+            seg = _stretched(t.file_path, audio, es, n_native, ratio)
+            stats["stretched"] += 1
+            stretched = True
+        else:
+            seg = audio[es:es + n_native]
+            stats["native"] += 1
+            stretched = False
+
         n = len(seg)
-        fi = int(np.clip(int(fade_bars) * bar_s, 1, n // 2))
+        if n < 2:
+            return None
+        fi = int(np.clip(int(fade_bars) * (n / max(1, int(seg_bars))), 1, n // 2))
         env = np.ones(n, dtype=np.float32)
         env[:fi]  = np.sin(np.linspace(0.0, np.pi / 2.0, fi))
         env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
-        return (seg * env.reshape(-1, 1)).astype(np.float32)
+        return ((seg * env.reshape(-1, 1)).astype(np.float32), eff, stretched, fi / sr)
 
     chaos = float(np.clip(chaos, 0.0, 1.0))
     # High chaos dices sections so we can enter partway through one, and lowers
@@ -1131,9 +1181,9 @@ def render_collage(
     # on one grid. Very short splices can't stack that way (a 2-bar segment over
     # a 1-bar hop is only 2 deep), so high chaos allows beat-granular hops:
     # beats still line up, only the downbeat phase shifts between layers.
-    beat_s = max(1, int(round(bar_s / 4)))
+    # (the concrete bar/beat sizes are taken per-placement from `ref`, since the
+    # reference tempo now follows whatever is actually sounding)
     sub_beat_hops = chaos >= 0.5
-    hop_floor_s = beat_s if sub_beat_hops else bar_s
     seg_pool = _segment_pool(tracks, bar, sub_bars=sub_bars, min_len_sec=min_len)
     have_emb = any(s.embedding for _, s in seg_pool)
 
@@ -1145,7 +1195,10 @@ def render_collage(
     def place(t, section, seg_bars, fade_bars, mode, hop_bars):
         """Overlap-add one segment at `pos`, log it, advance `pos` by hop_bars."""
         nonlocal pos
-        seg = emit(t, section, seg_bars, fade_bars)
+        prune()
+        lock = len(active) > 0        # something is sounding -> must beat-lock
+        got = emit(t, section, seg_bars, fade_bars, lock)
+        seg, eff, was_stretched, fade_sec = got if got else (None, 0.0, False, 0.0)
         end = min(pos + len(seg), len(master)) if seg is not None else pos
         if seg is not None and end > pos:
             master[pos:end] += seg[:end - pos]
@@ -1157,19 +1210,35 @@ def render_collage(
                 "track": t.file_path, "title": t.title,
                 "out_start": round(pos / sr, 3),
                 "out_end": round((pos + len(seg)) / sr, 3),
-                "fade_in": round(int(fade_bars) * bar, 3),
-                "fade_out": round(int(fade_bars) * bar, 3),
+                "fade_in": round(fade_sec, 3),
+                "fade_out": round(fade_sec, 3),
                 "mode": mode, "section": section.label,
-                "bpm": round(set_bpm, 1), "key": t.key,
+                "bpm": round(eff, 1), "key": t.key,
             })
             active.append((section.embedding, pos + len(seg)))
             recent.append(t.file_path)
-        step = max(hop_floor_s, int(round(float(hop_bars) * bar_s)))
+            if not was_stretched:
+                # It played native, so it now sets the tempo others lock to.
+                ref["bpm"] = eff
+                ref["bar_s"] = _time_to_samples((60.0 / eff) * 4, sr)
+
+        # Hops follow the *current* reference tempo, so the grid tracks whatever
+        # is actually sounding rather than a fixed global median.
+        bar_s_ref = ref["bar_s"]
+        beat_ref = max(1, int(round(bar_s_ref / 4)))
+        hop_floor_s = beat_ref if sub_beat_hops else bar_s_ref
+        if seg is None:
+            # Nothing was placed (e.g. the entry ran off the end of the track).
+            # Nudge minimally so the next pick fills this space instead of
+            # leaving a hole in the timeline.
+            pos += beat_ref
+            return
+        step = max(hop_floor_s, int(round(float(hop_bars) * bar_s_ref)))
         if sub_beat_hops:
             # Fractional-bar hops would land layers off-beat against each other,
             # so snap to the shared beat grid. (Only here: a bar isn't always an
             # exact 4 sample-beats, so quantising whole-bar hops would drift.)
-            step = max(hop_floor_s, int(round(step / beat_s)) * beat_s)
+            step = max(hop_floor_s, int(round(step / beat_ref)) * beat_ref)
         pos += step
 
     def pick_next(last_key, complement=False):
