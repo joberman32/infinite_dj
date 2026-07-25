@@ -29,6 +29,15 @@ _STATIC = {"/player.css", "/player.js", "/setup.css", "/setup.js"}
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
+# job_id -> RadioSession (endless mixes; separate lifecycle from one-shot jobs)
+_radios: dict = {}
+_radios_lock = threading.Lock()
+
+
+def _radio(job_id):
+    with _radios_lock:
+        return _radios.get(job_id)
+
 
 def _job(job_id):
     with _jobs_lock:
@@ -193,6 +202,23 @@ def _make_handler(db_path, output_dir):
                 self._send_json({"job": job_id, "status": j.get("status"),
                                  "error": j.get("error"),
                                  "duration": j.get("duration")})
+            elif route == "/api/radio/state":
+                q = self._query()
+                s = _radio((q.get("job") or [None])[0])
+                if not s:
+                    self._send_json({"error": "unknown radio session"}, 404); return
+                self._send_json(s.state())
+            elif route == "/api/radio/chunk":
+                q = self._query()
+                s = _radio((q.get("job") or [None])[0])
+                try:
+                    idx = int((q.get("i") or ["-1"])[0])
+                except ValueError:
+                    idx = -1
+                path = s.chunk_path(idx) if s else None
+                if not path:
+                    self.send_error(404); return
+                self._send_ranged(path, _CTYPE[".wav"])
             elif route == "/timeline.json":
                 path = self._job_artifact("timeline")
                 self._send_whole(path, _CTYPE[".json"]) if path else self.send_error(404)
@@ -205,14 +231,61 @@ def _make_handler(db_path, output_dir):
             else:
                 self.send_error(404)
 
+        def _read_spec(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n) or b"{}")
+
         def do_POST(self):
-            if self.path.split("?", 1)[0] != "/api/render":
+            route = self.path.split("?", 1)[0]
+
+            if route == "/api/radio/stop":
+                q = self._query()
+                s = _radio((q.get("job") or [None])[0])
+                if s:
+                    s.stop()
+                    s.cleanup()
+                    with _radios_lock:
+                        _radios.pop(s.job_id, None)
+                self._send_json({"stopped": True}); return
+
+            if route == "/api/radio":
+                if not db_path:
+                    self._send_json({"error": "server has no library"}, 400); return
+                try:
+                    spec = self._read_spec()
+                except Exception as e:
+                    self._send_json({"error": f"bad request: {e}"}, 400); return
+                try:
+                    from .db import TrackDB
+                    from .mixspec import (radio_profile, radio_supported,
+                                          select_tracks)
+                    from .radio import RadioSession
+                    if not radio_supported(spec):
+                        self._send_json(
+                            {"error": "radio isn't available at INSANE yet"}, 400)
+                        return
+                    db = TrackDB(db_path); tracks = db.load_all(); db.close()
+                    pool = select_tracks(spec, tracks)
+                    job_id = uuid.uuid4().hex[:12]
+                    session = RadioSession(pool, output_dir, job_id,
+                                           params=radio_profile(spec))
+                    with _radios_lock:
+                        _radios[job_id] = session
+                    # Prime synchronously so the client can start immediately,
+                    # then let the lookahead run ahead of the listener.
+                    session.prime()
+                    session.start()
+                    self._send_json({"job": job_id, **session.state()})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            if route != "/api/render":
                 self.send_error(404); return
             if not db_path:
                 self._send_json({"error": "server has no library"}, 400); return
             try:
-                n = int(self.headers.get("Content-Length") or 0)
-                spec = json.loads(self.rfile.read(n) or b"{}")
+                spec = self._read_spec()
             except Exception as e:
                 self._send_json({"error": f"bad request: {e}"}, 400); return
 

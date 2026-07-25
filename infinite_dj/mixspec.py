@@ -159,6 +159,35 @@ def resolve_params(spec: dict) -> dict:
                        "seed": spec.get("seed", random.randint(0, 10 ** 6))}}
 
 
+def radio_profile(spec: dict) -> dict:
+    """
+    Collage arguments for an endless radio session. Radio always uses the
+    (resumable) collage engine; the level shapes its character rather than
+    switching renderers, since `render_set` has no resumable form.
+
+    INSANE is deliberately excluded — see `radio_supported`.
+    """
+    level = (spec.get("serendipity") or "medium").lower()
+    lo, hi = _seg_bounds(spec)
+    to_bars = lambda s, floor: max(floor, int(s / _SEC_PER_BAR))
+
+    if level == "low":
+        # Long-form: big segments, calm movements, mostly one thing at a time.
+        return {"layers": 2, "min_seg_bars": to_bars(max(lo, 60.0), 24),
+                "max_seg_bars": to_bars(max(hi, 150.0), 48), "chaos": 0.0}
+    if level == "high":
+        return {"layers": 3, "min_seg_bars": to_bars(lo, 4),
+                "max_seg_bars": to_bars(hi, 12), "chaos": 0.35}
+    # medium
+    return {"layers": 2, "min_seg_bars": to_bars(max(lo, 30.0), 12),
+            "max_seg_bars": to_bars(max(hi, 75.0), 24), "chaos": 0.12}
+
+
+def radio_supported(spec: dict) -> bool:
+    """INSANE radio is bracketed: its cost is CLAP scoring, not rendering."""
+    return (spec.get("serendipity") or "medium").lower() != "insane"
+
+
 def select_tracks(spec: dict, tracks: List[TrackMeta]) -> List[TrackMeta]:
     """Filter the library to the spec's selected track ids (all if unset)."""
     ids = spec.get("track_ids")
