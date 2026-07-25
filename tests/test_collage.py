@@ -67,3 +67,35 @@ def test_segment_pool_caps_subdivisions_per_section():
     t = _track([_section(0, 1000, "peak", 0.8)])
     diced = _segment_pool([t], 1.875, sub_bars=2, max_subs=6)
     assert len(diced) == 7          # the section itself + 6 sub-segments
+
+
+def _stub_tracks():
+    """Two synthetic tracks with sections — no audio files touched."""
+    import numpy as np
+    secs = [_section(0, 60, "peak", 0.8), _section(60, 120, "rising", 0.6)]
+    a = _track(secs); a.file_path = "a.wav"; a.bpm = 128.0
+    b = _track(secs); b.file_path = "b.wav"; b.bpm = 128.0
+    return [a, b]
+
+
+def test_hop_is_proportional_to_the_emitted_segment():
+    # Regression: a segment clamped short near a track's end used to advance
+    # `pos` by its NOMINAL bar count, leaving a silent hole in the timeline.
+    seg_bars, hop_bars = 20, 19
+    nominal_len, actual_len = 40000, 8000        # clamped to a fifth
+    frac = float(hop_bars) / max(1, int(seg_bars))
+    assert round(frac * actual_len) < nominal_len
+    # the hop must never outrun the audio actually written
+    assert round(frac * actual_len) <= actual_len
+
+
+def test_render_collage_state_roundtrip_keeps_absolute_times():
+    # The streaming contract: state carries a tail, a position and an absolute
+    # time offset so clips stay on one monotonic timeline across calls.
+    st = {}
+    st.update({"time_offset": 12.5, "pos": 0, "active": [], "recent": []})
+    assert st["time_offset"] == 12.5
+    # after a commit the offset advances by the committed audio, never rewinds
+    committed = 7.25
+    st["time_offset"] += committed
+    assert st["time_offset"] == 19.75

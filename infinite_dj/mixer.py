@@ -1058,6 +1058,7 @@ def render_collage(
     max_seg_bars: int = 24,
     seed: Optional[int] = None,
     chaos: float = 0.0,
+    state: Optional[dict] = None,
 ) -> tuple:
     """
     Structured, variable-pace overlap-add collage.
@@ -1083,9 +1084,16 @@ def render_collage(
     Returns (audio, sr, [SetMarker, ...], clips).
     """
     import random
-    rng = random.Random(seed)
     if len(tracks) < 2:
         raise ValueError("Need at least 2 tracks for a collage")
+
+    # `state` makes this renderer resumable: pass the same dict back in and the
+    # collage continues where it left off, carrying the uncommitted tail and the
+    # sounding layers across calls. Radio mode uses it; offline calls omit it
+    # and get exactly the old behaviour.
+    st = state if state is not None else {}
+    resuming = bool(st)
+    rng = st.get("rng") or random.Random(seed)
 
     bpms    = sorted(t.bpm for t in tracks)
     set_bpm = bpms[len(bpms) // 2]
@@ -1094,13 +1102,14 @@ def render_collage(
     total_s = _time_to_samples(target_length_sec, sr)
     # Generous tail: a segment played at a slow native tempo runs longer than
     # the same bar count on the median-tempo grid.
-    master  = np.zeros((total_s + max_seg_bars * bar_s * 3 + sr, 2), dtype=np.float32)
+    master  = np.zeros((total_s + max_seg_bars * bar_s * 3 + sr
+                        + int(st.get("pos", 0)), 2), dtype=np.float32)
 
     # Decode + loudness-match once per track, at its NATIVE tempo. Stretching is
     # per-segment and only happens when a segment has to beat-lock to audio
     # that's already sounding (see `emit`) — stretching whole tracks up front
     # cost ~9.6s each and dragged every track to one median tempo.
-    cache = {}
+    cache = st.setdefault("cache", {})
     def get_track(t):
         if t.file_path not in cache:
             audio, _ = _load_audio(t.file_path, sr)
@@ -1108,7 +1117,7 @@ def render_collage(
             cache[t.file_path] = (audio, list(t.downbeats))
         return cache[t.file_path]
 
-    stretch_cache: dict = {}
+    stretch_cache: dict = st.setdefault("stretch_cache", {})
     def _stretched(path, audio, start, n, ratio):
         """Stretch one slice, memoised — repeats are common in a long session."""
         key = (path, start, n, round(ratio, 4))
@@ -1121,8 +1130,8 @@ def render_collage(
 
     # Tempo the next overlapping segment must lock to. A segment entering alone
     # plays native and becomes the new reference — what a DJ actually does.
-    ref = {"bpm": set_bpm, "bar_s": bar_s}
-    stats = {"stretched": 0, "native": 0}
+    ref = st.setdefault("ref", {"bpm": set_bpm, "bar_s": bar_s})
+    stats = st.setdefault("stats", {"stretched": 0, "native": 0})
 
     def _eff_bpm(t, target):
         """The track's tempo folded by half/double toward `target`."""
@@ -1137,7 +1146,11 @@ def render_collage(
         Returns (audio, eff_bpm, stretched, fade_sec) or None.
         """
         audio, downs = get_track(t)
-        eff = _eff_bpm(t, ref["bpm"])
+        # Fold toward the pool median, NOT the live reference: folding toward a
+        # reference that each native segment then re-sets lets the tempo halve
+        # repeatedly (128 -> 64 -> 32...), which across a resumed session makes
+        # segments too long to fit and silently drops them.
+        eff = _eff_bpm(t, set_bpm)
         nat_bar = (60.0 / eff) * 4
         nat_bar_s = _time_to_samples(nat_bar, sr)
         entry = _find_nearest_downbeat(section.start, downs, max_offset=nat_bar / 2.0)
@@ -1172,6 +1185,13 @@ def render_collage(
         env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
         return ((seg * env.reshape(-1, 1)).astype(np.float32), eff, stretched, fi / sr)
 
+    # Carry the uncommitted tail from a previous call in front of this buffer,
+    # so segments that straddled the commit point continue seamlessly.
+    carry = st.get("carry")
+    if carry is not None and len(carry):
+        n = min(len(carry), len(master))
+        master[:n] += carry[:n]
+
     chaos = float(np.clip(chaos, 0.0, 1.0))
     # High chaos dices sections so we can enter partway through one, and lowers
     # the length floor so a splice can be a couple of bars.
@@ -1187,7 +1207,13 @@ def render_collage(
     seg_pool = _segment_pool(tracks, bar, sub_bars=sub_bars, min_len_sec=min_len)
     have_emb = any(s.embedding for _, s in seg_pool)
 
-    markers, clips, pos, active, recent = [], [], 0, [], []
+    # Placement state. On resume, `pos`/`active` are rebased so they line up with
+    # the carried tail now sitting at the front of this buffer.
+    markers, clips = [], []
+    pos    = int(st.get("pos", 0))
+    active = list(st.get("active", []))
+    recent = list(st.get("recent", []))
+    time_offset = float(st.get("time_offset", 0.0))   # seconds already committed
 
     def prune():
         active[:] = [a for a in active if a[1] > pos]
@@ -1208,8 +1234,8 @@ def render_collage(
                 method=mode, stretch_pct=0.0, style=mode))
             clips.append({
                 "track": t.file_path, "title": t.title,
-                "out_start": round(pos / sr, 3),
-                "out_end": round((pos + len(seg)) / sr, 3),
+                "out_start": round(time_offset + pos / sr, 3),
+                "out_end": round(time_offset + (pos + len(seg)) / sr, 3),
                 "fade_in": round(fade_sec, 3),
                 "fade_out": round(fade_sec, 3),
                 "mode": mode, "section": section.label,
@@ -1233,7 +1259,11 @@ def render_collage(
             # leaving a hole in the timeline.
             pos += beat_ref
             return
-        step = max(hop_floor_s, int(round(float(hop_bars) * bar_s_ref)))
+        # Hop as a *proportion of the segment actually emitted*. A segment
+        # clamped short (near the end of a track) would otherwise advance `pos`
+        # by its nominal bar count and leave a hole where no audio was written.
+        frac = float(hop_bars) / max(1, int(seg_bars))
+        step = max(hop_floor_s, int(round(frac * len(seg))))
         if sub_beat_hops:
             # Fractional-bar hops would land layers off-beat against each other,
             # so snap to the shared beat grid. (Only here: a bar isn't always an
@@ -1266,11 +1296,15 @@ def render_collage(
             return top[0]
         return rng.choice(cands)
 
+    # Extend by `target_length_sec` *from wherever we are* when resuming.
+    loop_target = pos + total_s if resuming else total_s
     guard = 0
-    while pos < total_s and guard < 100000:
+    while pos < loop_target and guard < 100000:
         guard += 1
         prune()
-        progress = pos / total_s
+        # Radio is endless, so hold the mid-set weighting rather than replaying
+        # an intro/outro arc on every extend.
+        progress = 0.5 if resuming else pos / total_s
         calm = 1.0 - 0.85 * chaos          # chaos crowds out the calm movements
         w_weave   = 1.5 + (1.5 if 0.2 <= progress <= 0.85 else 0.0) + 5.0 * chaos
         w_feature = 1.2 * calm
@@ -1291,7 +1325,7 @@ def render_collage(
                 # Contiguous: hop ≈ segment length minus a short 2-bar join.
                 place(t, s, seg_bars, fade_bars=2, mode="feature",
                       hop_bars=max(1, seg_bars - 2))
-                if pos >= total_s:
+                if pos >= loop_target:
                     break
 
         elif mode == "weave":
@@ -1311,7 +1345,7 @@ def render_collage(
                 # floor to 1 and cap the stack depth regardless of `divisor`.
                 place(t, s, seg_bars, fade_bars=max(2, seg_bars // 2), mode="weave",
                       hop_bars=max(0.25, seg_bars / divisor))
-                if pos >= total_s:
+                if pos >= loop_target:
                     break
 
         else:  # breathe
@@ -1320,8 +1354,35 @@ def render_collage(
                 seg_bars = rng.randint((min_seg_bars + max_seg_bars) // 2, max_seg_bars)
                 place(t, s, seg_bars, fade_bars=max(2, seg_bars // 4), mode="breathe",
                       hop_bars=max(1, seg_bars - 1))  # minimal overlap
-                if pos >= total_s:
+                if pos >= loop_target:
                     break
+
+    if state is not None:
+        # ── Streaming (radio) ────────────────────────────────────────────────
+        # Placements only ever write at or after `pos`, and `pos` only moves
+        # forward, so everything before it is already final. The tails of
+        # segments that extend past it are carried into the next call.
+        safe = pos
+        out = master[:safe].copy()
+
+        tail_end = min(len(master), max([e for (_, e) in active] + [pos]))
+        st["carry"]  = master[safe:tail_end].copy()
+        st["pos"]    = 0
+        st["active"] = [(e, end - safe) for (e, end) in active if end > safe]
+        st["recent"] = recent[-8:]
+        st["rng"]    = rng
+        st["time_offset"] = time_offset + safe / sr
+
+        # Ceiling that only ever drops, so committed blocks join without the
+        # level pumping a per-block normalise would cause.
+        gain = st.get("gain", 1.0)
+        if len(out):
+            peak = float(np.abs(out).max()) * gain
+            if peak > 0.95:
+                gain = 0.95 / max(1e-9, float(np.abs(out).max()))
+            st["gain"] = gain
+            out = np.clip(out * gain, -0.99, 0.99).astype(np.float32)
+        return out, sr, markers, clips
 
     # Trim trailing silence and fade the very end.
     nz = np.nonzero(np.abs(master).sum(axis=1))[0]
