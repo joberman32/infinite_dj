@@ -286,6 +286,60 @@ def _linear_fade(n: int) -> tuple[np.ndarray, np.ndarray]:
     return fade_out, fade_in
 
 
+# ── Fade shapes ───────────────────────────────────────────────────────────────
+#
+# The collage overlap-adds independent segments rather than crossfading a pair,
+# so each segment carries its own in/out envelope. Giving those envelopes a
+# vocabulary — and letting the two ends differ — is what turns a uniform
+# "everything fades the same way" collage into one with gesture.
+
+FADE_SHAPES = ("equal_power", "linear", "exp", "log", "scurve", "hold", "slam")
+
+
+def _fade_curve(n: int, shape: str = "equal_power", rising: bool = True) -> np.ndarray:
+    """An n-sample gain ramp: 0→1 when `rising`, else 1→0."""
+    if n <= 1:
+        return np.ones(max(n, 0), dtype=np.float32)
+    x = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    if not rising:
+        x = x[::-1]                      # mirror: same curve, run backwards
+    if shape == "linear":
+        g = x
+    elif shape == "exp":                 # sneaks in late, then arrives
+        g = x ** 2.5
+    elif shape == "log":                 # arrives at once, then settles
+        g = 1.0 - (1.0 - x) ** 2.5
+    elif shape == "scurve":              # gentle at both ends
+        g = x * x * (3.0 - 2.0 * x)
+    elif shape == "hold":                # mostly full, quick knee at the edge
+        g = np.clip(x * 4.0, 0.0, 1.0)
+    elif shape == "slam":                # a few ms of ramp: a cut without a click
+        g = np.clip(x * 12.0, 0.0, 1.0)
+    else:                                # equal_power — constant perceived level
+        g = np.sin(x * (np.pi / 2.0))
+    return g.astype(np.float32)
+
+
+def _pick_fade_shapes(mode: str, chaos: float, rng) -> tuple:
+    """
+    (fade_in, fade_out) shapes for one placement.
+
+    Bold, abrupt shapes are reserved for `weave`, where heavy overlap means
+    another layer is always covering — a hard stop in a solo `breathe` segment
+    would just read as a dropout.
+    """
+    if mode == "feature":
+        # Contiguous sections of one track: the join should be invisible.
+        return "equal_power", "equal_power"
+    if mode == "breathe":
+        # One thing at a time — let it swell in and settle out.
+        return rng.choice(("scurve", "exp")), rng.choice(("scurve", "equal_power"))
+    if rng.random() < chaos * 0.6:       # weave, feeling bold
+        return (rng.choice(("slam", "hold", "log")),
+                rng.choice(("hold", "slam", "equal_power")))
+    return rng.choice(("equal_power", "scurve", "exp")), "equal_power"
+
+
 def _loudness_match(
     audio: np.ndarray,
     src_loudness: Optional[float],
@@ -1138,7 +1192,8 @@ def render_collage(
         return min((t.bpm, t.bpm * 2.0, t.bpm / 2.0),
                    key=lambda b: abs(target / b - 1.0))
 
-    def emit(t, section, seg_bars, fade_bars, lock):
+    def emit(t, section, seg_bars, fade_bars, lock,
+             shape_in="equal_power", shape_out="equal_power"):
         """
         Slice `seg_bars` bars at the track's native tempo. When `lock`, stretch
         that slice to the reference tempo so it beat-locks with what's already
@@ -1181,8 +1236,10 @@ def render_collage(
             return None
         fi = int(np.clip(int(fade_bars) * (n / max(1, int(seg_bars))), 1, n // 2))
         env = np.ones(n, dtype=np.float32)
-        env[:fi]  = np.sin(np.linspace(0.0, np.pi / 2.0, fi))
-        env[-fi:] = np.cos(np.linspace(0.0, np.pi / 2.0, fi))
+        env[:fi]  = _fade_curve(fi, shape_in, rising=True)
+        env[-fi:] = _fade_curve(fi, shape_out, rising=False)
+        # `seg` may be a view into the cached track (or a cached stretch), so
+        # multiply into a new array rather than in place.
         return ((seg * env.reshape(-1, 1)).astype(np.float32), eff, stretched, fi / sr)
 
     # Carry the uncommitted tail from a previous call in front of this buffer,
@@ -1230,7 +1287,8 @@ def render_collage(
         overlap = max([e for (_, e) in active], default=pos) - pos
         est_len = max(1, int(seg_bars) * ref["bar_s"])
         lock = overlap > 0.25 * est_len
-        got = emit(t, section, seg_bars, fade_bars, lock)
+        shape_in, shape_out = _pick_fade_shapes(mode, chaos, rng)
+        got = emit(t, section, seg_bars, fade_bars, lock, shape_in, shape_out)
         seg, eff, was_stretched, fade_sec = got if got else (None, 0.0, False, 0.0)
         end = min(pos + len(seg), len(master)) if seg is not None else pos
         if seg is not None and end > pos:
@@ -1246,6 +1304,7 @@ def render_collage(
                 "fade_in": round(fade_sec, 3),
                 "fade_out": round(fade_sec, 3),
                 "mode": mode, "section": section.label,
+                "fade_shape": f"{shape_in}/{shape_out}",
                 "bpm": round(eff, 1), "key": t.key,
             })
             active.append((section.embedding, pos + len(seg)))

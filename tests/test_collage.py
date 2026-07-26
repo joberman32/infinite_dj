@@ -99,3 +99,48 @@ def test_render_collage_state_roundtrip_keeps_absolute_times():
     committed = 7.25
     st["time_offset"] += committed
     assert st["time_offset"] == 19.75
+
+
+# ── fade shape vocabulary ────────────────────────────────────────────────────
+
+def test_every_fade_shape_is_a_valid_monotonic_ramp():
+    import numpy as np
+    from infinite_dj.mixer import FADE_SHAPES, _fade_curve
+    for shape in FADE_SHAPES:
+        up = _fade_curve(256, shape, rising=True)
+        dn = _fade_curve(256, shape, rising=False)
+        assert np.isfinite(up).all() and np.isfinite(dn).all()
+        assert abs(up[0]) < 1e-6 and abs(up[-1] - 1.0) < 1e-6      # 0 -> 1
+        assert abs(dn[0] - 1.0) < 1e-6 and abs(dn[-1]) < 1e-6      # 1 -> 0
+        assert np.all(np.diff(up) >= -1e-6)                        # never dips
+        assert np.all(np.diff(dn) <= 1e-6)
+        assert up.min() >= 0.0 and up.max() <= 1.0
+
+
+def test_fade_curve_handles_degenerate_lengths():
+    from infinite_dj.mixer import _fade_curve
+    assert len(_fade_curve(0, "exp")) == 0
+    assert len(_fade_curve(1, "exp")) == 1      # no room to ramp; stays unity
+
+
+def test_abrupt_shapes_are_reserved_for_weave():
+    # A hard stop in a solo `breathe` segment would read as a dropout; only
+    # weave (which always has another layer covering) may be bold.
+    import random
+    from infinite_dj.mixer import _pick_fade_shapes
+    rng = random.Random(0)
+    for mode in ("feature", "breathe"):
+        for _ in range(60):
+            a, b = _pick_fade_shapes(mode, 1.0, rng)
+            assert "slam" not in (a, b) and "hold" not in (a, b)
+    bold = any("slam" in _pick_fade_shapes("weave", 1.0, rng)
+               for _ in range(60))
+    assert bold, "weave at full chaos should sometimes pick abrupt shapes"
+
+
+def test_feature_joins_stay_invisible():
+    import random
+    from infinite_dj.mixer import _pick_fade_shapes
+    rng = random.Random(1)
+    for _ in range(20):
+        assert _pick_fade_shapes("feature", 1.0, rng) == ("equal_power", "equal_power")
