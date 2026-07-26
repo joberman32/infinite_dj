@@ -144,3 +144,78 @@ def test_feature_joins_stay_invisible():
     rng = random.Random(1)
     for _ in range(20):
         assert _pick_fade_shapes("feature", 1.0, rng) == ("equal_power", "equal_power")
+
+
+# ── per-layer EQ moves ───────────────────────────────────────────────────────
+
+def _noise(seconds=4.0, sr=44100):
+    import numpy as np
+    rng = np.random.default_rng(0)
+    return (rng.standard_normal((int(seconds * sr), 2)) * 0.2).astype("float32")
+
+
+def _band_rms(a, sr, cutoff, kind="low"):
+    import numpy as np
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, cutoff / (sr / 2), btype="low", output="sos")
+    lo = sosfiltfilt(sos, a, axis=0)
+    return float(np.sqrt(np.mean((lo if kind == "low" else a - lo) ** 2)))
+
+
+def test_flat_eq_move_is_a_free_no_op():
+    from infinite_dj.mixer import _apply_eq_move
+    x = _noise()
+    assert _apply_eq_move(x, 44100, "flat", 1000) is x     # same object: no cost
+
+
+def test_zero_phase_split_reconstructs_exactly():
+    import numpy as np
+    from infinite_dj.mixer import _split3_zerophase
+    x = _noise()
+    lo, mid, hi = _split3_zerophase(x, 44100)
+    assert np.abs((lo + mid + hi) - x).max() < 1e-6
+
+
+def test_lowcut_actually_removes_low_end():
+    # Regression: with the CAUSAL split, attenuating the low band phase-shifted
+    # rather than cancelled it and RAISED low energy to 1.13x. Zero-phase
+    # filtering is what makes turning a band down actually turn it down.
+    from infinite_dj.mixer import LOW_CUT, _apply_eq_move
+    x = _noise()
+    y = _apply_eq_move(x, 44100, "lowcut", 4000)
+    assert _band_rms(y, 44100, LOW_CUT) < 0.5 * _band_rms(x, 44100, LOW_CUT)
+
+
+def test_sweeps_act_at_the_edges_they_name():
+    from infinite_dj.mixer import LOW_CUT, _apply_eq_move
+    sr, fade = 44100, int(0.4 * 44100)
+    x = _noise(8.0)
+    head, mid = slice(0, int(0.4 * sr)), slice(3 * sr, 4 * sr)
+    tail = slice(-int(0.4 * sr), None)
+
+    si = _apply_eq_move(x, sr, "sweep_in", fade)
+    assert _band_rms(si[head], sr, LOW_CUT) < 0.5 * _band_rms(x[head], sr, LOW_CUT)
+    assert _band_rms(si[mid], sr, LOW_CUT) > 0.9 * _band_rms(x[mid], sr, LOW_CUT)
+
+    so = _apply_eq_move(x, sr, "sweep_out", fade)
+    assert _band_rms(so[tail], sr, LOW_CUT) < 0.6 * _band_rms(x[tail], sr, LOW_CUT)
+    assert _band_rms(so[head], sr, LOW_CUT) > 0.9 * _band_rms(x[head], sr, LOW_CUT)
+
+    # bass_first modulates the HIGH band, so it must be probed there.
+    bf = _apply_eq_move(x, sr, "bass_first", fade)
+    assert _band_rms(bf[head], sr, LOW_CUT, "high") < \
+        0.6 * _band_rms(x[head], sr, LOW_CUT, "high")
+
+
+def test_eq_move_guards_slices_too_short_to_filter():
+    from infinite_dj.mixer import _apply_eq_move
+    tiny = _noise(0.0005)                       # ~22 samples; filtfilt would raise
+    assert _apply_eq_move(tiny, 44100, "lowcut", 4).shape == tiny.shape
+
+
+def test_feature_mode_never_changes_tone():
+    import random
+    from infinite_dj.mixer import _pick_eq_move
+    rng = random.Random(0)
+    assert all(_pick_eq_move("feature", 1.0, n, rng) == "flat"
+               for n in range(5) for _ in range(20))

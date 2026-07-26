@@ -320,6 +320,85 @@ def _fade_curve(n: int, shape: str = "equal_power", rising: bool = True) -> np.n
     return g.astype(np.float32)
 
 
+# ── Per-layer EQ moves ────────────────────────────────────────────────────────
+#
+# `_blend` rides a 3-band EQ across a *pair* of tracks, which doesn't fit the
+# collage's N-way overlap-add. These are the per-layer equivalent: each segment
+# carries its own low/mid/high envelope over its lifetime, so a layer can open
+# up like a DJ lifting a high-pass, or stack over an existing groove without
+# fighting it for the low end.
+#
+# "flat" returns the segment untouched, so the common case costs nothing — the
+# band split is only paid for when a gesture actually uses it.
+
+EQ_MOVES = ("flat", "sweep_in", "sweep_out", "bass_first", "lowcut")
+
+
+def _split3_zerophase(audio: np.ndarray, sr: int) -> tuple:
+    """
+    Zero-phase (low, mid, high) split, for offline whole-segment processing.
+
+    `_split3` filters causally, which is required for the real-time engine's
+    incremental `CrossfadeFilterState` — but a causal IIR phase-shifts each
+    band, so turning one *down* does not cancel it. Measured: attenuating the
+    low band 85% causally *raised* low-band energy to 1.13x; zero-phase gives
+    the intended 0.24x. The collage has whole segments in hand, so it can and
+    should filter zero-phase.
+    """
+    from scipy.signal import butter, sosfiltfilt
+    lo_sos = butter(4, LOW_CUT / (sr / 2), btype="low", output="sos")
+    mid_sos = butter(4, MID_CUT / (sr / 2), btype="low", output="sos")
+    lp_low = sosfiltfilt(lo_sos, audio, axis=0)
+    lp_mid = sosfiltfilt(mid_sos, audio, axis=0)
+    return (lp_low.astype(np.float32),
+            (lp_mid - lp_low).astype(np.float32),
+            (audio - lp_mid).astype(np.float32))
+
+
+def _apply_eq_move(seg: np.ndarray, sr: int, move: str, fade_len: int) -> np.ndarray:
+    """Apply a per-band gain envelope to one segment."""
+    # sosfiltfilt pads internally, so very short slices can't be filtered.
+    if move == "flat" or len(seg) < 64:
+        return seg
+    low, mid, high = _split3_zerophase(seg, sr)
+    n = len(seg)
+    lo_g = np.ones(n, dtype=np.float32)
+    hi_g = np.ones(n, dtype=np.float32)
+    span = int(np.clip(fade_len * 3, 1, n))
+    if move == "sweep_in":               # highs first, low end swings in after
+        lo_g[:span] = _fade_curve(span, "scurve", rising=True)
+    elif move == "sweep_out":            # low end leaves early, highs linger
+        lo_g[-span:] = _fade_curve(span, "scurve", rising=False)
+    elif move == "bass_first":           # low end lands, the top arrives after
+        hi_g[:span] = _fade_curve(span, "scurve", rising=True)
+    elif move == "lowcut":               # never claims the low end at all
+        lo_g[:] = 0.15                   # a trace, so it doesn't sound hollow
+    return (low * lo_g.reshape(-1, 1) + mid
+            + high * hi_g.reshape(-1, 1)).astype(np.float32)
+
+
+def _pick_eq_move(mode: str, chaos: float, n_active: int, rng) -> str:
+    """
+    Choose a layer's EQ gesture. Feature joins stay flat so contiguous sections
+    of one track don't audibly change tone mid-track. When several layers are
+    already sounding, a new one is more likely to enter low-cut — the expressive
+    version of "one source holds the bottom", chosen per layer rather than
+    imposed as a global rule.
+    """
+    if mode == "feature":
+        return "flat"
+    if mode == "breathe":
+        return "sweep_in" if rng.random() < 0.3 else "flat"
+    if n_active >= 2 and rng.random() < 0.5 + 0.3 * chaos:
+        return "lowcut"
+    r = rng.random()
+    if r < 0.35 * chaos:
+        return "sweep_in"
+    if r < 0.50 * chaos:
+        return rng.choice(("sweep_out", "bass_first"))
+    return "flat"
+
+
 def _pick_fade_shapes(mode: str, chaos: float, rng) -> tuple:
     """
     (fade_in, fade_out) shapes for one placement.
@@ -1193,7 +1272,7 @@ def render_collage(
                    key=lambda b: abs(target / b - 1.0))
 
     def emit(t, section, seg_bars, fade_bars, lock,
-             shape_in="equal_power", shape_out="equal_power"):
+             shape_in="equal_power", shape_out="equal_power", eq_move="flat"):
         """
         Slice `seg_bars` bars at the track's native tempo. When `lock`, stretch
         that slice to the reference tempo so it beat-locks with what's already
@@ -1235,6 +1314,10 @@ def render_collage(
         if n < 2:
             return None
         fi = int(np.clip(int(fade_bars) * (n / max(1, int(seg_bars))), 1, n // 2))
+        # Band gains first (on the raw slice), then the overall amplitude
+        # envelope — filtering a signal that's already fading would smear the
+        # gesture across the fade.
+        seg = _apply_eq_move(seg, sr, eq_move, fi)
         env = np.ones(n, dtype=np.float32)
         env[:fi]  = _fade_curve(fi, shape_in, rising=True)
         env[-fi:] = _fade_curve(fi, shape_out, rising=False)
@@ -1288,7 +1371,9 @@ def render_collage(
         est_len = max(1, int(seg_bars) * ref["bar_s"])
         lock = overlap > 0.25 * est_len
         shape_in, shape_out = _pick_fade_shapes(mode, chaos, rng)
-        got = emit(t, section, seg_bars, fade_bars, lock, shape_in, shape_out)
+        eq_move = _pick_eq_move(mode, chaos, len(active), rng)
+        got = emit(t, section, seg_bars, fade_bars, lock,
+                   shape_in, shape_out, eq_move)
         seg, eff, was_stretched, fade_sec = got if got else (None, 0.0, False, 0.0)
         end = min(pos + len(seg), len(master)) if seg is not None else pos
         if seg is not None and end > pos:
@@ -1304,7 +1389,7 @@ def render_collage(
                 "fade_in": round(fade_sec, 3),
                 "fade_out": round(fade_sec, 3),
                 "mode": mode, "section": section.label,
-                "fade_shape": f"{shape_in}/{shape_out}",
+                "fade_shape": f"{shape_in}/{shape_out}", "eq": eq_move,
                 "bpm": round(eff, 1), "key": t.key,
             })
             active.append((section.embedding, pos + len(seg)))
