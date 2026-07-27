@@ -216,6 +216,13 @@ async function scheduleAhead() {
   }
 }
 
+// Reveal the fixed dBFS gradient up to `v` rather than scaling the fill, so a
+// colour always means the same level.
+function setMeter(el, v) {
+  const f = Math.max(0, Math.min(1, v));
+  el.style.clipPath = `inset(${(1 - f) * 100}% 0 0 0)`;
+}
+
 let smoothL = 0, smoothR = 0;
 function updateMeters() {
   let lvL = 0, lvR = 0;
@@ -228,8 +235,8 @@ function updateMeters() {
   // Fast attack, slower release, so it reads like a real meter.
   smoothL = lvL > smoothL ? lvL : smoothL * 0.85;
   smoothR = lvR > smoothR ? lvR : smoothR * 0.85;
-  $("meter-l").style.transform = `scaleY(${smoothL})`;
-  $("meter-r").style.transform = `scaleY(${smoothR})`;
+  setMeter($("meter-l"), smoothL);
+  setMeter($("meter-r"), smoothR);
   peakL = Math.max(smoothL, peakL - 0.012);
   peakR = Math.max(smoothR, peakR - 0.012);
   $("peak-l").style.bottom = `${peakL * 100}%`;

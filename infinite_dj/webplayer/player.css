@@ -7,6 +7,7 @@
   --meter-green: #35d05b;
   --meter-yellow: #f0cf3a;
   --meter-orange: #f58232;
+  --meter-red: #f2402e;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
@@ -64,14 +65,21 @@ body {
     repeating-linear-gradient(to bottom, transparent 0 3px, var(--bg) 3px 4px),
     var(--bg);
   overflow: hidden; }
-.meter-fill { position: absolute; inset: 0; transform: scaleY(0); transform-origin: bottom;
+/* The gradient is anchored to the FULL track height and revealed by clipping,
+   so a colour means a fixed dBFS range. (Scaling the fill instead squeezed the
+   whole green→red ramp into whatever height was showing, so every level looked
+   identical.) Zones over the -60..0 dBFS scale: green below -12, yellow -12..-6,
+   orange -6..-3, red -3..0 where clipping starts. */
+.meter-fill { position: absolute; inset: 0;
   background:
     repeating-linear-gradient(to top, var(--bg) 0 2px, transparent 2px 5px),
     linear-gradient(to top,
-      var(--meter-green) 0 80%,
-      var(--meter-yellow) 80% 90%,
-      var(--meter-orange) 90% 100%);
-  transition: transform 40ms linear; }
+      var(--meter-green)  0    80%,
+      var(--meter-yellow) 80%  90%,
+      var(--meter-orange) 90%  95%,
+      var(--meter-red)    95% 100%);
+  clip-path: inset(100% 0 0 0);
+  transition: clip-path 40ms linear; }
 .peak { position: absolute; left: 0; right: 0; height: 2px; background: var(--fg);
   bottom: 0%; transition: bottom 60ms linear; }
 .meter-tag { color: var(--dim); font-size: 11px; letter-spacing: .12em; }
