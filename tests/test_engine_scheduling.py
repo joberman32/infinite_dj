@@ -1,4 +1,7 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+
 import numpy as np
 
 from infinite_dj.engine import (
@@ -106,6 +109,19 @@ class RealtimeCrossfadeTests(unittest.TestCase):
 
         self.assertIsInstance(progress, float)
         self.assertAlmostEqual(progress, 0.75)
+
+    def test_terminal_ui_does_not_crash_if_given_a_phase_ramp(self):
+        current = track("current", [])
+        engine = StreamEngine([current, track("next", [])])
+        engine.state.track = current
+        engine.state.is_mixing = True
+        engine.state.mix_progress = np.linspace(0.25, 0.75, 32, dtype=np.float32)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            engine._render_ui()
+
+        self.assertIn("[MIXING 75%]", output.getvalue())
 
     def test_stateful_chunked_blend_matches_continuous_rendering(self):
         n = 512

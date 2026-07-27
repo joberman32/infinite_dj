@@ -878,7 +878,8 @@ class StreamEngine:
 
         mixing_str = ""
         if t.is_mixing:
-            pct = int(t.mix_progress * 100)
+            progress = np.clip(_crossfade_progress(t.mix_progress), 0.0, 1.0)
+            pct = int(progress * 100)
             mixing_str = f"  [MIXING {pct}%]"
 
         next_str = ""
