@@ -178,7 +178,10 @@ function radioTime() {
 async function radioPoll() {
   if (!RADIO || !jobParam) return;
   try {
-    const s = await (await fetch(`/api/radio/state?job=${jobParam}`)).json();
+    const played = radioTime().toFixed(3);
+    const s = await (await fetch(
+      `/api/radio/state?job=${encodeURIComponent(jobParam)}&played=${played}`
+    )).json();
     if (s.error) { $("cur-title").textContent = s.error; return; }
     TL = { clips: s.clips || [], tracks: s.tracks || {}, duration: s.generated_sec };
     TRACKS = TL.tracks;

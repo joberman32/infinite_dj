@@ -237,6 +237,11 @@ def _transition_start_time(
     return future[0] if future else producer_position
 
 
+def _crossfade_progress(phase) -> float:
+    """Return the latest scalar progress value from a per-sample phase ramp."""
+    return float(np.asarray(phase).reshape(-1)[-1])
+
+
 def _build_crossfade_chunk(
     out_audio: np.ndarray,
     in_audio:  np.ndarray,
@@ -616,7 +621,7 @@ class StreamEngine:
                 in_pos     += actual
                 pos        += actual
 
-                self.state.mix_progress = phase
+                self.state.mix_progress = _crossfade_progress(phase)
 
                 if xfade_done >= xfade_total:
                     # Crossfade complete — continue incoming at its native tempo

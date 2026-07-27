@@ -7,6 +7,7 @@ from infinite_dj.engine import (
     TransitionEvent,
     _audible_track_position,
     _build_crossfade_chunk,
+    _crossfade_progress,
     _transition_start_time,
 )
 from infinite_dj.mixer import CrossfadeFilterState, TransitionStyle, _blend
@@ -98,6 +99,14 @@ class TransitionSchedulingTests(unittest.TestCase):
 
 
 class RealtimeCrossfadeTests(unittest.TestCase):
+    def test_crossfade_progress_stays_scalar_for_the_ui(self):
+        phase = np.linspace(0.25, 0.75, 32, dtype=np.float32)
+
+        progress = _crossfade_progress(phase)
+
+        self.assertIsInstance(progress, float)
+        self.assertAlmostEqual(progress, 0.75)
+
     def test_stateful_chunked_blend_matches_continuous_rendering(self):
         n = 512
         outgoing = np.ones((n * 2, 2), dtype=np.float32)

@@ -4,6 +4,21 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-26 — Repair endless radio and live crossfade progress
+
+- Radio lookahead is now measured from the browser's audible playback cursor,
+  not from time zero. The player sends a monotonic playback heartbeat with each
+  state poll; `RadioSession` resumes rendering whenever
+  `generated_sec - played_sec` falls below the lookahead. Previously it reached
+  four minutes of total output and then idled forever.
+- Heartbeats are clamped to generated audio so malformed future positions cannot
+  trigger unbounded catch-up rendering. Radio state exposes played and buffered
+  seconds for diagnosis.
+- The live engine now stores the final scalar from each per-sample crossfade
+  phase ramp in `PlaybackState.mix_progress`. It previously stored the full
+  NumPy vector, which made the terminal UI fail when converting progress to a
+  percentage.
+
 ## 2026-07-24 — `chaos`: make INSANE genuinely wild
 
 - `render_collage(chaos=0..1)` is a wildness master. As it rises: weave crowds

@@ -13,7 +13,6 @@ buffer races ahead of the listener within seconds of starting.
 
 import os
 import threading
-import time
 from typing import List, Optional
 
 import numpy as np
@@ -55,6 +54,7 @@ class RadioSession:
         self.error: Optional[str] = None
         self._pending = np.zeros((0, 2), dtype=np.float32)   # not yet a full chunk
         self._generated = 0.0           # seconds of audio committed to chunks
+        self._played = 0.0              # latest client-reported playback position
 
         os.makedirs(out_dir, exist_ok=True)
 
@@ -84,11 +84,28 @@ class RadioSession:
         while not self._stop.is_set():
             # Stay a comfortable distance ahead, then idle rather than
             # rendering (and writing) audio nobody may ever hear.
-            if self._generated >= self.lookahead_sec:
-                time.sleep(0.5)
+            if not self._needs_render():
+                self._stop.wait(0.5)
                 continue
             if not self._render_block(BLOCK_SEC):
                 break
+
+    def update_playback_position(self, seconds: float):
+        """Advance the listener cursor used to maintain the lookahead window."""
+        if not np.isfinite(seconds) or seconds < 0:
+            raise ValueError("playback position must be a finite non-negative number")
+        with self._lock:
+            # Playback is monotonic and cannot consume audio we have not emitted.
+            # The clamp also prevents a malformed heartbeat from causing an
+            # unbounded catch-up render.
+            self._played = max(self._played, min(float(seconds), self._generated))
+
+    def _buffered_ahead(self) -> float:
+        with self._lock:
+            return max(0.0, self._generated - self._played)
+
+    def _needs_render(self) -> bool:
+        return self._buffered_ahead() < self.lookahead_sec
 
     # ── rendering ────────────────────────────────────────────────────────────
 
@@ -145,6 +162,7 @@ class RadioSession:
             chunks = [{"i": c["i"], "start": c["start"], "dur": c["dur"]}
                       for c in self.chunks]
             generated = self._generated
+            played = self._played
             err = self.error
         # Same shape the player already consumes for a finished mix, so the
         # dashboard's labels and crossfade animation work unchanged.
@@ -155,6 +173,8 @@ class RadioSession:
             "sr": self.sr,
             "chunk_sec": CHUNK_SEC,
             "generated_sec": round(generated, 3),
+            "played_sec": round(played, 3),
+            "buffered_sec": round(max(0.0, generated - played), 3),
             "chunks": chunks,
             "clips": tl["clips"],
             "tracks": tl["tracks"],

@@ -207,6 +207,12 @@ def _make_handler(db_path, output_dir):
                 s = _radio((q.get("job") or [None])[0])
                 if not s:
                     self._send_json({"error": "unknown radio session"}, 404); return
+                played = (q.get("played") or [None])[0]
+                if played is not None:
+                    try:
+                        s.update_playback_position(float(played))
+                    except (TypeError, ValueError):
+                        self._send_json({"error": "invalid playback position"}, 400); return
                 self._send_json(s.state())
             elif route == "/api/radio/chunk":
                 q = self._query()
