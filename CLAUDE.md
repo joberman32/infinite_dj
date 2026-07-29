@@ -49,6 +49,11 @@ python dj.py --db custom.db <command>   # override default DB path (infinite_dj.
 | `studio [--port N] [--out-dir DIR]` | Launch the studio: pick tracks/albums, set Serendipity + Pace, then either generate a fixed-length mix or start **RADIO** (endless, plays until you hit EXIT) |
 | `serve --audio file.wav [--timeline JSON] [--port N]` | Launch the web player for an already-rendered set |
 | `play [--start title] [--arc ...] [--out file.wav] [--duration N]` | Real-time playback |
+| `mine <mix_dir> [--force]` | Mine DJ mixes + tracklist sidecars for calibration data |
+| `probe <mix> --idx N` | Full measurement detail for one mined boundary (debugging view) |
+| `corpus [--min-confidence F] [--json PATH]` | Mined distributions + rejection-bias report |
+| `calibrate [--out PATH] [--show]` | Derive engine constants from the corpus |
+| `validate [--pairs N]` | Engine vs corpus, reported against the measurement ceiling |
 
 Track arguments accept partial title matches or absolute file paths.
 
@@ -64,8 +69,25 @@ infinite_dj/
 ├── db.py                SQLite cache — skips re-analysis unless file changed
 ├── mixer.py             Beat alignment + 3-phase EQ crossfade renderer
 ├── sequencer.py         Compatibility graph + greedy/energy-arc sequencing
-└── engine.py            Real-time streaming engine + lookahead scheduler
+├── engine.py            Real-time streaming engine + lookahead scheduler
+├── mix_grid.py          Piecewise tempo tracking for whole DJ mixes
+├── transition_probe.py  Measures one transition from mix audio alone (I/O-free DSP)
+├── mix_corpus.py        Tracklist parsing + corpus mining + distributions
+├── calibration.py       Mined constants w/ provenance; falls back to defaults
+└── validation.py        Engine-vs-corpus comparison + measurement ceiling
 ```
+
+## Calibration from real DJ mixes
+
+`CALIBRATION.md` has the Phase 1 results and the Phase 2 recommendation. **Read
+it before touching `transition_probe.py` or extending the mining** — it records
+what is and isn't recoverable from mix audio, and two negative results that are
+expensive to rediscover (per-band automation phase isn't recoverable; blend
+duration carries ~25 beats of error, so only its central tendency is usable).
+
+The engine reads `calibration.json` if present. Absent or thin, every value falls
+back to the constant it replaced, and rendering is byte-identical — pinned by
+`tests/test_calibration.py`.
 
 ## Key Design Details
 
@@ -97,10 +119,11 @@ infinite_dj/
 
 ### Full-set rendering (`render_set` in `mixer.py`)
 - Lays all tracks on ONE continuous timeline: each plays solo at its native tempo, consecutive tracks overlap only during an adaptive crossfade, only the final track fades out. No silence gaps, no double-rendered tracks.
-- **Breathing room**: a track plays a substantial solo (`min_solo_bars`, default 32) and only exits at a strong, phrase-aligned OUT cue past that dwell.
+- **Breathing room**: a track plays a substantial solo (`min_solo_bars`, default 32 or the calibrated value) and only exits at a strong, phrase-aligned OUT cue past that dwell.
+- ⚠ `render_set`'s `n_mix_bars` parameter is **dead**: `style.n_bars` overwrites it. Crossfade length is only reachable through `choose_transition_style`.
 - Per-transition tempo reference (outgoing track's native tempo) — no global tempo lock/drift.
 - Output is 16-bit PCM at the source sample rate (44.1 kHz).
-- Returns `(audio, sr, [SetMarker])`; `render-set` prints transition timestamps, style + stretch.
+- Returns `(audio, sr, [SetMarker], [clip])`; `render-set` prints transition timestamps, style + stretch.
 
 ### Set sequencing (`sequence_for_mixing` in `sequencer.py`)
 - The sequencer `render-set` uses: strongly prefers beat-matchable (tempo-compatible) neighbours so the render uses gentle blends rather than hard cuts, then harmony and energy-arc fit break ties. Produces a no-repeat permutation for a full set.
@@ -116,14 +139,18 @@ Scheduler fires a transition when:
 2. `MAX_DWELL_BARS` have elapsed (hard cap)
 
 Key constants in `engine.py`:
-- `MIN_DWELL_BARS = 16` — minimum bars before early exit
-- `MAX_DWELL_BARS = 64` — hard cap, forces transition
+- `MIN_DWELL_BARS = 32` — minimum bars before early exit
+- `MAX_DWELL_BARS = 96` — hard cap, forces transition
 - `LOOKAHEAD_BARS = 16` — scheduler lookahead window
 - `BUFFER_SECONDS = 8.0` — ring buffer size (increase if glitching)
 
+The dwell bounds are read through `_dwell_bounds()`, which prefers mined values
+from `calibration.py` and falls back to the constants above.
+
 ### Harmonic compatibility (`harmony.py`)
 Camelot wheel scoring used by both `compatible` command and sequencer:
-- Same key: 1.0 | Parallel major/minor: 0.9 | ±1 step: 0.8 | ±2 steps: 0.6 | ±3 steps: 0.3 | else: 0.0
+- Same key: 1.0 | Parallel major/minor: 0.9 | ±1 step: 0.8 | ±2 steps: 0.6 | ±3 steps: 0.3
+- Cross-mode (A↔B) within ±1 step: 0.5 | else: 0.0
 
 ### Sequencing (`sequencer.py`)
 - Compatibility graph edge: `0.6 × harmonic_score + 0.4 × bpm_compatibility`

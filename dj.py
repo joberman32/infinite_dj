@@ -702,6 +702,41 @@ def cmd_calibrate(args):
     print("unchanged because fewer than the minimum observations back them.")
 
 
+def cmd_validate(args):
+    """Compare the engine's transition shape against the held-out mined corpus."""
+    from infinite_dj.validation import compare_to_corpus, format_validation_report
+
+    db = TrackDB(args.db)
+    tracks = db.load_all()
+    if len(tracks) < 2:
+        print("Need at least 2 analyzed tracks. Run: python dj.py analyze <dir>")
+        db.close()
+        sys.exit(1)
+
+    counts = db.corpus_counts()
+    if not counts["n_accepted"]:
+        print("No mined transitions to validate against.")
+        print("Run: python dj.py mine <mix_dir>")
+        print("\nThe measurement ceiling can still be established without a")
+        print("corpus — it only needs the local library:")
+        print("  python dj.py validate --ceiling-only")
+        if not args.ceiling_only:
+            db.close()
+            sys.exit(1)
+
+    print(f"Rendering and probing {args.pairs} engine transitions "
+          "(a few seconds each)...")
+    res = compare_to_corpus(db, tracks, min_confidence=args.min_confidence,
+                            n_pairs=args.pairs, seed=args.seed)
+    db.close()
+    print()
+    print(format_validation_report(res))
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(res, fh, indent=2)
+        print(f"\nWrote {args.json}")
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -856,6 +891,19 @@ def main():
                        help="Print the current calibration and its provenance "
                             "without rebuilding it")
 
+    p_val = sub.add_parser(
+        "validate", help="Compare the engine against the mined corpus")
+    p_val.add_argument("--min-confidence", type=float, default=0.5,
+                       dest="min_confidence",
+                       help="Confidence floor for mined measurements (default 0.5)")
+    p_val.add_argument("--pairs", type=int, default=12,
+                       help="Engine transitions to render and probe (default 12)")
+    p_val.add_argument("--seed", type=int, default=0,
+                       help="Seed for pair selection and the holdout split")
+    p_val.add_argument("--ceiling-only", action="store_true", dest="ceiling_only",
+                       help="Establish the measurement ceiling without a corpus")
+    p_val.add_argument("--json", help="Also write the report to this JSON path")
+
     args = parser.parse_args()
 
     # A calibration file is read automatically; this only overrides the path.
@@ -880,6 +928,7 @@ def main():
         "probe":      cmd_probe,
         "corpus":     cmd_corpus,
         "calibrate":  cmd_calibrate,
+        "validate":   cmd_validate,
     }
 
     if args.command not in dispatch:

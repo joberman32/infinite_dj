@@ -4,6 +4,53 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-07-29 — Corpus mining and calibration (Phase 1)
+
+Full results and the Phase 2 recommendation are in [CALIBRATION.md](CALIBRATION.md).
+Read that before extending any of this; the headline is that the bottleneck is
+measurement accuracy, not the engine.
+
+- `plan_transition` extracted from `render_set`'s loop as a pure function, so
+  cue and style selection can be replayed without rendering audio. Verified
+  byte-identical on a 6-track set covering both the beatmatch and cut paths.
+  Two constraints keep it faithful: `dur_out` must be the *loaded* audio length
+  (not `TrackMeta.duration`), and the sample-domain clamps stay in `render_set`
+  because one of them depends on the style that planning returns.
+- New `mix_grid.py`: piecewise tempo tracking for whole mixes.
+  `analyzer._compute_beats` assumes one tempo per file, which is right for a
+  track and wrong for a 60-minute set. Reuses `_refine_tempo_phase` unmodified.
+- New `transition_probe.py`: measures a transition from mix audio alone via a
+  two-source non-negative decomposition per band. The obvious approach — a
+  broadband similarity ramp — recovers 3.7 bars for a known 16-bar crossfade,
+  because the low band dominates spectral energy and is a *switch, not a ramp*.
+  Band separation is mandatory, not an optimisation.
+- New `mix_corpus.py` + `mixes`/`transitions` tables (`DB_VERSION` 3). Rejected
+  boundaries are persisted with all sub-scores so thresholds can be re-tuned by
+  re-querying rather than re-running audio analysis — which paid for itself
+  immediately, as the first real run rejected 100% of boundaries on an absolute
+  residual threshold that only suited synthetic tones.
+- New `calibration.py`, wired into `choose_transition_style` (crossfade bars),
+  `render_set`/`plan_transition` (`min_solo_bars`), the engine's dwell bounds and
+  the sequencer's minimum edge score. Defaults are exactly the previous
+  hardcoded values, so an absent `calibration.json` is a no-op; a permanent test
+  pins byte-identical rendering. Values below 20 observations are refused.
+- New `validation.py` + `dj.py validate`. Both sides of any comparison are
+  rendered and probed through the same pipeline — reading the engine's automation
+  lanes analytically would attribute the probe's biases to the DJ. The report
+  always shows the measurement ceiling beside the hit rate.
+- New CLI: `mine`, `probe`, `corpus`, `calibrate`, `validate`. Nothing fetches
+  anything; the corpus is whatever is placed in a folder.
+- Two negative results worth not rediscovering: per-band automation phase
+  (`_make_profile`'s `cp` and leads) is ~2.7x compressed and **not** calibratable
+  despite being the highest-value target on paper; and blend *duration* carries
+  ~25 beats of median error on 32-48 beat transitions, so only its central
+  tendency over many transitions is usable. Cut-vs-blend classification and
+  transition placement are the parts that work well.
+- Doc fixes: `MIN_DWELL_BARS`/`MAX_DWELL_BARS` were documented as 16/64 but are
+  32/96; `render_set` returns a 4-tuple, not 3; the Camelot cross-mode 0.5 rule
+  was undocumented; `render_set`'s `n_mix_bars` parameter is dead, since
+  `style.n_bars` overwrites it.
+
 ## 2026-07-26 — Repair endless radio and live crossfade progress
 
 - Radio lookahead is now measured from the browser's audible playback cursor,
