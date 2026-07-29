@@ -615,6 +615,67 @@ def cmd_play(args):
         print(f"\nDone. {out_file} ({mb:.1f} MB)")
 
 
+# ── Mix-corpus mining ─────────────────────────────────────────────────────────
+
+def cmd_mine(args):
+    """Measure every announced boundary in a folder of mixes + tracklists."""
+    from infinite_dj.mix_corpus import scan_corpus
+
+    db = TrackDB(args.db)
+    print(f"Mining mixes in {args.mine_dir} ...")
+    summary = scan_corpus(args.mine_dir, db, force=args.force)
+
+    if not summary["n_pairs"]:
+        print("\nNo (audio + tracklist) pairs found.")
+        print("Drop mix audio in the folder with a sidecar next to each file:")
+        print("  somemix.mp3  +  somemix.txt   (lines like '12:04 Artist - Title')")
+        print("  somemix.mp3  +  somemix.cue   (standard cue sheet)")
+        print("  somemix.mp3  +  somemix.json  ([{\"t\": 724, \"title\": ...}])")
+        db.close()
+        return
+
+    counts = db.corpus_counts()
+    print(f"\nMined {summary['n_mined']} mix(es), skipped {summary['n_skipped']} "
+          "already current.")
+    print(f"Corpus now: {counts['n_mixes']} mixes, {counts['n_transitions']} "
+          f"boundaries, {counts['n_accepted']} measured.")
+    print("\nNext: python dj.py corpus")
+    db.close()
+
+
+def cmd_probe(args):
+    """Full measurement detail for one boundary — the debugging view."""
+    from infinite_dj.mix_corpus import format_probe_detail
+
+    db = TrackDB(args.db)
+    try:
+        detail = format_probe_detail(args.mix, args.idx, db)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
+        db.close()
+        sys.exit(1)
+    print(detail)
+    db.close()
+
+
+def cmd_corpus(args):
+    """Distributions mined from the corpus, plus the rejection-bias report."""
+    from infinite_dj.mix_corpus import corpus_stats, format_corpus_stats
+
+    db = TrackDB(args.db)
+    stats = corpus_stats(db, min_confidence=args.min_confidence)
+    if not stats["counts"]["n_transitions"]:
+        print("No mined transitions yet. Run: python dj.py mine <mix_dir>")
+        db.close()
+        return
+    print(format_corpus_stats(stats))
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(stats, fh, indent=2)
+        print(f"\nWrote {args.json}")
+    db.close()
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -732,6 +793,29 @@ def main():
     p_play.add_argument("--duration", type=float,
                         help="Stop after N seconds (useful with --out)")
 
+    # ── Mix-corpus mining (calibration) ──────────────────────────────────────
+    p_mine = sub.add_parser(
+        "mine", help="Mine a folder of DJ mixes + tracklists for calibration data")
+    p_mine.add_argument("mine_dir", metavar="MIX_DIR",
+                        help="Folder of mix audio, each with a .txt/.cue/.json "
+                             "tracklist sidecar beside it")
+    p_mine.add_argument("--force", action="store_true",
+                        help="Re-mine mixes even if already current")
+
+    p_probe = sub.add_parser(
+        "probe", help="Full measurement detail for one mined boundary")
+    p_probe.add_argument("mix", help="Partial mix filename or title")
+    p_probe.add_argument("--idx", type=int, required=True,
+                         help="Boundary index within the mix (1 = first transition)")
+
+    p_corpus = sub.add_parser(
+        "corpus", help="Distributions mined from the mix corpus")
+    p_corpus.add_argument("--min-confidence", type=float, default=0.5,
+                          dest="min_confidence",
+                          help="Drop measurements below this confidence "
+                               "(default 0.5; rows are kept in the DB regardless)")
+    p_corpus.add_argument("--json", help="Also write the stats to this JSON path")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -747,6 +831,9 @@ def main():
         "studio":     cmd_studio,
         "serve":      cmd_serve,
         "play":       cmd_play,
+        "mine":       cmd_mine,
+        "probe":      cmd_probe,
+        "corpus":     cmd_corpus,
     }
 
     if args.command not in dispatch:

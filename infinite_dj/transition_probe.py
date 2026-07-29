@@ -80,12 +80,12 @@ Measured accuracy against known crossfades, per band:
     fine — but the inter-band separations that would calibrate `cp`,
     `in_mid_lead` and `in_high_lead` are *themselves* of that order, so the
     measurement cannot resolve them. Sweeping `cp` from 0.35 to 0.72 (an 11.5 s
-    move of the true bass-swap centre) moved the measured centre 1.6 s:
-    monotone, but ~7x compressed, with no usable dynamic range against real-
-    world noise. Raising the low band's frequency resolution to 8192 did not
-    fix it, and flipped the apparent band ordering — which is how we know an
-    earlier "ordering recovered correctly" result was luck, not signal.
-    Treat `band_phase` as diagnostic output, not a calibration target.
+    move of the true bass-swap centre) moves the measured centre 4.2 s:
+    monotone, but ~2.7x compressed, which leaves too little dynamic range to
+    survive real-world noise. Raising the low band's frequency resolution to
+    8192 did not fix it, and flipped the apparent band ordering — which is how
+    we know an earlier "ordering recovered correctly" result was luck, not
+    signal. Treat `band_phase` as diagnostic output, not a calibration target.
 
 By contrast **duration is very well behaved**: measured span over nominal
 `n_bars` held at 0.787 +/- 0.008 across 4, 8, 12, 16, 24 and 32 bars for a
@@ -146,15 +146,37 @@ BAND_INSET_LO = 1.5    # a band starts this far above the crossover below it
 BAND_INSET_HI = 0.8    # ...and ends this fraction of the crossover above it
 
 # ── Reject thresholds ────────────────────────────────────────────────────────
-# A band whose two references are this correlated can't be decomposed: the Gram
-# matrix is near-singular and the split between sources is arbitrary. This is a
-# *pre-filter*, not a sufficient guard.
-MAX_RHO = 0.5
+# Reference correlation at which a band is genuinely degenerate — the Gram matrix
+# is near-singular and the split between sources is arbitrary.
+#
+# Deliberately high, and *not* the place to be strict. Real DJ tracks are far
+# more alike than synthetic tones: five tracks off one album gave a mid-band rho
+# of 0.836, and an earlier 0.5 cap rejected every boundary in a real mix. What
+# actually matters is whether the decomposition came out *degenerate*, and that
+# shows up directly in `travel` and `r2`. So separability is carried in the
+# confidence score (`sub["sep"]`), where it down-weights rather than discards,
+# and only hard-rejects when there's provably nothing to separate.
+MAX_RHO = 0.92
 # Least-squares fit quality for the logistic ramp.
 MIN_R2 = 0.5
-# Mean model residual over the transition; above this the two-source model isn't
-# explaining the audio (effects, a third deck, an echo-out).
-MAX_RESIDUAL = 0.6
+# How much worse the two-source model may fit *during* the transition than it
+# fits the clean reference windows either side.
+#
+# The absolute residual is not the right quantity, and using one was a real bug:
+# a 35 s mean spectrum is a crude model of any individual frame of real music, so
+# residuals of 0.6-0.7 are ordinary there while synthetic tones sit near 0. An
+# absolute 0.6 cap therefore rejected good measurements — high band with rho
+# 0.207, r2 0.923 and its centre correctly inside the crossfade — on every
+# boundary of a real mix.
+#
+# Measuring the floor from the reference windows makes the guard self-calibrating:
+# it asks "is the two-source model doing as well here as this material allows",
+# which is the question that was meant all along. It still catches what it exists
+# to catch — effects, echo-outs, a third deck — because those raise the residual
+# *relative* to the clean floor.
+MAX_RESIDUAL_EXCESS = 0.18
+# Absolute backstop, loose enough not to bind on real music.
+MAX_RESIDUAL = 0.95
 # The fitted ramp must actually travel. Below this the bands are too alike to
 # tell apart — which is exactly the long, smooth, timbrally-matched blend we
 # care most about, so this rejection is a known source of short-bias.
@@ -162,8 +184,16 @@ MIN_TRAVEL = 0.30
 # Cross-band centre agreement, in multiples of the median absolute deviation.
 AGREE_MAD = 3.0
 # A ramp narrower than this many beats, *with a good fit*, is a cut rather than
-# a blend. Narrow with a bad fit is a rejection.
-CUT_MAX_BEATS = 1.0
+# a blend. Narrow with a bad fit is a rejection, not a cut.
+#
+# One bar, which is the probe's honest resolution floor rather than a musical
+# judgement. On real material a true 0.30 s cut measures as 1-2 s: the STFT
+# window, the beat-length coefficient pooling and the logistic fit together can't
+# resolve below about a second, which at 120-135 BPM is 2-4 beats. Claiming to
+# distinguish a 0.3 s cut from a 2-beat fade would be claiming resolution we
+# don't have. (It also happens that nothing under a bar is a "blend" in any
+# musical sense.)
+CUT_MAX_BEATS = 4.0
 # Hard sanity bound on a plausible transition.
 MAX_DURATION_BEATS = 256.0
 
@@ -352,6 +382,14 @@ def _pool(x: np.ndarray, n: int) -> np.ndarray:
     pad = n // 2
     padded = np.pad(x, pad, mode="edge")
     return np.lib.stride_tricks.sliding_window_view(padded, n).sum(axis=-1)
+
+
+def _energy_weighted(values: np.ndarray, energy: np.ndarray) -> float:
+    """Energy-weighted mean, falling back to a plain mean on a silent band."""
+    total = float(np.sum(energy))
+    if total <= 0:
+        return float(np.mean(values)) if len(values) else 1.0
+    return float(np.dot(values, energy) / total)
 
 
 def pooled_alpha(a: np.ndarray, b: np.ndarray, n: int) -> np.ndarray:
@@ -619,11 +657,41 @@ def probe_transition(
             # position; weight the fit (and the residual) by band energy so
             # sparse percussive bands stay usable.
             energy = Sx.sum(axis=0)
-            tc, w, span, travel, r2 = fit_ramp(alpha, times[b_sl_search],
-                                               weights=energy)
-            wsum = float(energy.sum())
-            residual = float(np.dot(resid, energy) / wsum) if wsum > 0 \
-                else float(np.mean(resid))
+            t_x = times[b_sl_search]
+            tc, w, span, travel, r2 = fit_ramp(alpha, t_x, weights=energy)
+
+            # Refit locally around the located centre.
+            #
+            # The search window spans minutes, so a single global fit lets noise
+            # in the far plateaus set the width. On real music that inflated a
+            # 0.30 s cut into a 46-92 s "blend" even though the centre was within
+            # a second of correct. Locating globally and measuring locally
+            # separates the two questions, which are not equally hard: the centre
+            # is robust, the width is not.
+            if np.isfinite(tc) and np.isfinite(w):
+                half = float(np.clip(3.0 * w, 4.0 * beat_sec,
+                                     max(4.0 * beat_sec, (t_x[-1] - t_x[0]) / 2)))
+                m = (t_x >= tc - half) & (t_x <= tc + half)
+                if int(m.sum()) >= 12:
+                    tc2, w2, span2, travel2, r2_2 = fit_ramp(
+                        alpha[m], t_x[m], weights=energy[m])
+                    # Keep the refit only if it stayed put and explains the local
+                    # data at least as well.
+                    if (np.isfinite(tc2) and abs(tc2 - tc) < half
+                            and travel2 >= 0.5 * travel):
+                        tc, w, span, travel, r2 = tc2, w2, span2, travel2, r2_2
+
+            residual = _energy_weighted(resid, energy)
+
+            # The residual floor: how well "a mean spectrum" models this material
+            # at all, measured where we know the answer (clean A is exactly `ra`).
+            # Only the excess over this floor is evidence of something the
+            # two-source model can't represent.
+            floor = 0.0
+            for ref_sl in (b_sl_a, b_sl_b):
+                S_ref = Sb[:, ref_sl]
+                _, _, r_ref = unmix_two_source(S_ref, ra, rb)
+                floor = max(floor, _energy_weighted(r_ref, S_ref.sum(axis=0)))
 
             reason = ""
             if rho > MAX_RHO:
@@ -637,7 +705,8 @@ def probe_transition(
                 reason = "low_travel"
             elif r2 < MIN_R2:
                 reason = "poor_fit"
-            elif residual > MAX_RESIDUAL:
+            elif residual > MAX_RESIDUAL or \
+                    residual - floor > MAX_RESIDUAL_EXCESS:
                 reason = "high_residual"
             fits[band] = BandFit(band, rho, tc, w, span, travel, r2, residual,
                                  reason == "", reason)
@@ -713,9 +782,29 @@ def probe_transition(
 
     # ── Combine ──────────────────────────────────────────────────────────────
     # Duration comes from mid/high; the low band contributes only its centre.
-    span = float(np.median([f.span_1090 for f in duration_bands]))
-    t_center = float(np.median([f.center_t for f in duration_bands]))
+    #
+    # Pick the *best-fitting* band rather than the median of them. A median lets
+    # one bad band corrupt a good one, and on real material bands differ wildly
+    # in quality: at a hard cut in a real mix the high band showed a clean step
+    # (alpha 0.07 -> 0.55 exactly at the cut) while the mid band, whose reference
+    # sat 50 s away in non-stationary material, was noise — and the median of the
+    # two reported a 46 s blend where the truth was a 0.30 s cut.
+    #
+    # `r2 * travel` is the ranking: r2 says a ramp explains this band's alpha at
+    # all, travel says the ramp actually goes somewhere.
+    best = max(duration_bands, key=lambda f: f.r2 * max(f.travel, 0.0))
+    span = float(best.span_1090)
+    t_center = float(best.center_t)
     duration_beats = span / beat_sec
+
+    # Disagreement between the duration bands is itself evidence the measurement
+    # is unreliable, so it has to reach the confidence score rather than being
+    # averaged away.
+    spans = [f.span_1090 for f in duration_bands if np.isfinite(f.span_1090)]
+    if len(spans) > 1 and max(spans) > 0:
+        span_agree = float(np.clip(min(spans) / max(spans), 0.0, 1.0))
+    else:
+        span_agree = 0.6   # a single band: neither corroborated nor contradicted
 
     is_cut = duration_beats < CUT_MAX_BEATS
     if is_cut:
@@ -732,17 +821,27 @@ def probe_transition(
     low = fits.get("low")
     t_bass = low.center_t if (low is not None and low.ok) else None
 
-    agree_score = float(np.clip(1.0 - (mad / (2.0 * beat_sec)), 0.0, 1.0)) \
-        if len(surviving) > 1 else 0.5
+    # Score band agreement against the same tolerance the guard uses, not against
+    # a beat. Normalising by a beat made this collapse to 0 on almost every real
+    # boundary — bands legitimately differ by seconds — and since confidence is
+    # their geometric mean, one zero dragged every accepted measurement to ~0.09
+    # and made `--min-confidence` useless as a filter.
+    agree_score = (float(np.clip(1.0 - (mad / tol), 0.0, 1.0))
+                   if len(surviving) > 1 and tol > 0 else 0.5)
     sub = {
         "sep": round(float(np.clip(1.0 - max(f.rho for f in agreed), 0.0, 1.0)), 4),
         "fit": round(float(np.mean([f.r2 for f in agreed])), 4),
         "travel": round(float(np.clip(np.mean([f.travel for f in agreed]), 0.0, 1.0)), 4),
         "resid": round(float(np.clip(1.0 - np.mean([f.residual for f in agreed]), 0.0, 1.0)), 4),
         "agree": round(agree_score, 4),
+        "span_agree": round(span_agree, 4),
         "refs": round(float(purity), 4),
     }
-    vals = np.array([max(v, 1e-6) for v in sub.values()])
+    # Geometric mean, so a single bad component drags the result down rather than
+    # being averaged away — but floored, so it degrades instead of annihilating.
+    # (Each component already has a hard reject threshold; confidence is for
+    # ranking what survived, not for gatekeeping.)
+    vals = np.array([max(float(v), 0.05) for v in sub.values()])
     confidence = float(np.exp(np.mean(np.log(vals))))
 
     return ProbeResult(
