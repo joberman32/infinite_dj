@@ -146,7 +146,7 @@ def sequence_greedy(
     tracks: List[TrackMeta],
     start: Optional[TrackMeta] = None,
     n_tracks: Optional[int] = None,
-    min_score: float = 0.3,
+    min_score: Optional[float] = None,
     cooldown: int = 5,
     seed: Optional[int] = None,
 ) -> Sequence:
@@ -158,10 +158,16 @@ def sequence_greedy(
         start:      Starting track (random if None).
         n_tracks:   How many tracks in the sequence (all if None).
         min_score:  Minimum compatibility score to accept a transition.
-                    If no track meets this, picks the best available.
+                    If no track meets this, picks the best available. Defaults to
+                    the calibrated value (0.3 without a mined corpus) — real DJs
+                    mix out of key considerably more than the Camelot ladder
+                    implies, so a corpus is likely to loosen this.
         cooldown:   Don't revisit a track until this many tracks have played.
         seed:       Random seed for reproducibility.
     """
+    if min_score is None:
+        from .calibration import value as _cal
+        min_score = float(_cal("harmonic_min_score"))
     if seed is not None:
         random.seed(seed)
 

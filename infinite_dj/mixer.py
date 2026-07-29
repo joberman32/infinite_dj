@@ -558,19 +558,32 @@ def choose_transition_style(out_cue, in_cue, beatmatched: bool,
                                   out_mid_hold, out_high_hold),
         )
 
+    # Crossfade lengths come from the calibration layer, which falls back to
+    # these same 16/12/8/8 bars when no mined corpus is present. The per-band
+    # automation (cp / leads) stays hand-set: corpus measurement can't resolve
+    # per-band phase — see infinite_dj/calibration.py.
+    from .calibration import value as _cal
+
+    def bars(name: str) -> int:
+        return max(1, int(round(_cal(name))))
+
     if (sim is not None and sim >= high_sim_threshold) or (eo < 0.45 and ei < 0.45):
         # High textural similarity or both sparse: long, symmetric smooth blend.
-        return styled("blend", 16, cp=0.55, mid_lead=0.12, high_lead=0.12)
+        return styled("blend", bars("blend_bars"),
+                      cp=0.55, mid_lead=0.12, high_lead=0.12)
     if eo > 0.70 and ei > 0.70:
         # Drop → drop: bring the incoming HATS in early over the outgoing groove,
         # hold its MIDS back to avoid clash, then swap the bass mid-way.
-        return styled("swap", 8, cp=0.50, mid_lead=0.50, high_lead=0.10,
+        return styled("swap", bars("swap_bars"),
+                      cp=0.50, mid_lead=0.50, high_lead=0.10,
                       out_mid_hold=0.50, out_high_hold=0.30)
     if eo >= ei:
         # Busier → calmer: gentle medium fade, incoming eased in.
-        return styled("fade", 12, cp=0.55, mid_lead=0.30, high_lead=0.20)
+        return styled("fade", bars("fade_bars"),
+                      cp=0.55, mid_lead=0.30, high_lead=0.20)
     # Calmer → rising: bring the incoming up sooner across all bands.
-    return styled("build", 8, cp=0.40, mid_lead=0.10, high_lead=0.05)
+    return styled("build", bars("build_bars"),
+                  cp=0.40, mid_lead=0.10, high_lead=0.05)
 
 
 
@@ -975,7 +988,7 @@ def plan_transition(
     read_t: float,
     dur_out: float,
     *,
-    min_solo_bars: int = 32,
+    min_solo_bars: Optional[int] = None,
     max_stretch: float = MAX_STRETCH,
     sim_threshold: float = 0.82,
     splice: Optional[tuple] = None,
@@ -991,10 +1004,14 @@ def plan_transition(
     the length of its *loaded* audio (which differs slightly from the analyzed
     `duration`, so it has to be passed in rather than read off the TrackMeta).
     `splice` is `(min_seg_sec, max_seg_sec)` for collage mode, else None.
+    `min_solo_bars` defaults to the calibrated value (32 without a corpus).
 
     Sample-domain clamping stays in the caller: it depends on the rendered buffer
     length and, for the tail clamp, on the style this function returns.
     """
+    if min_solo_bars is None:
+        from .calibration import value as _cal
+        min_solo_bars = int(round(_cal("min_solo_bars")))
     out_bpm = track_out.bpm
     out_bar_sec = (60.0 / out_bpm) * 4
 
@@ -1056,7 +1073,7 @@ def render_set(
     n_mix_bars: int = 16,
     sr: int = MIX_SR,
     max_stretch: float = MAX_STRETCH,
-    min_solo_bars: int = 32,
+    min_solo_bars: Optional[int] = None,
     min_seg_sec: Optional[float] = None,
     max_seg_sec: Optional[float] = None,
     target_length_sec: Optional[float] = None,
@@ -1074,10 +1091,15 @@ def render_set(
 
     Transitions adapt via `choose_transition_style`; each track plays at its own
     native tempo, only the incoming crossfade region is stretched to lock beats.
-    Returns (audio, sr, [SetMarker, ...]).
+    `min_solo_bars` defaults to the calibrated value (32 without a corpus).
+    Returns (audio, sr, [SetMarker, ...], [clip, ...]).
     """
     if len(tracks) < 2:
         raise ValueError("Need at least 2 tracks to render a set")
+
+    if min_solo_bars is None:
+        from .calibration import value as _cal
+        min_solo_bars = int(round(_cal("min_solo_bars")))
 
     splice = max_seg_sec is not None
 

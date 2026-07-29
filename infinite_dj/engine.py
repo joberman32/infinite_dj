@@ -103,8 +103,26 @@ CHUNK_FRAMES = 4096    # frames per producer iteration (~93ms at 44.1kHz)
 BUFFER_SECONDS = 8.0   # ring buffer size
 BUFFER_FRAMES  = int(BUFFER_SECONDS * SR)
 LOOKAHEAD_BARS = 16    # scheduler looks this many bars ahead for OUT cues
+# Dwell bounds. These are the fallbacks; `_dwell_bounds()` prefers mined values
+# when a calibration corpus supplies them (see infinite_dj/calibration.py).
 MIN_DWELL_BARS = 32    # minimum bars to play before mixing out (let tracks breathe)
 MAX_DWELL_BARS = 96    # force transition after this many bars if none found
+
+
+def _dwell_bounds() -> tuple:
+    """
+    (min, max) dwell in bars, from the calibration layer.
+
+    Read per scheduler tick rather than captured at import so a recalibration
+    takes effect without restarting, and so tests can set one without patching
+    module globals.
+    """
+    from .calibration import value as _cal
+    lo = int(round(_cal("min_dwell_bars")))
+    hi = int(round(_cal("max_dwell_bars")))
+    if hi <= lo:                       # a thin corpus could invert these
+        lo, hi = MIN_DWELL_BARS, MAX_DWELL_BARS
+    return lo, hi
 
 
 def _fmt_time(seconds: float) -> str:
@@ -767,6 +785,7 @@ class StreamEngine:
                     print(f"\n  ⏭  Up next: {next_t.title} [{next_t.key}]")
 
             # 2. Check upcoming OUT cue points
+            min_dwell, max_dwell = _dwell_bounds()
             lookahead_window = bar_dur * LOOKAHEAD_BARS
             upcoming_outs = [
                 c for c in current.cue_points
@@ -777,7 +796,7 @@ class StreamEngine:
 
             if not upcoming_outs:
                 # No upcoming cue — check hard cap
-                if bars_played >= MAX_DWELL_BARS and self.state.next_track:
+                if bars_played >= max_dwell and self.state.next_track:
                     self._fire_transition("max dwell reached")
                 continue
 
@@ -787,7 +806,7 @@ class StreamEngine:
 
             # 4. Decide whether to fire
             should_fire = (
-                bars_played >= MIN_DWELL_BARS          # played long enough
+                bars_played >= min_dwell               # played long enough
                 and time_to_out <= bar_dur * 8         # within 8 bars
                 and self.state.next_track is not None
             )

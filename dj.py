@@ -676,6 +676,32 @@ def cmd_corpus(args):
     db.close()
 
 
+def cmd_calibrate(args):
+    """Derive engine constants from the mined corpus and write them out."""
+    from infinite_dj.calibration import build_from_stats, load, save
+    from infinite_dj.mix_corpus import corpus_stats
+
+    if args.show:
+        cal = load(args.out)
+        print(cal.describe())
+        return
+
+    db = TrackDB(args.db)
+    stats = corpus_stats(db, min_confidence=args.min_confidence)
+    db.close()
+
+    if not stats["counts"]["n_transitions"]:
+        print("No mined transitions. Run: python dj.py mine <mix_dir>")
+        sys.exit(1)
+
+    cal = build_from_stats(stats)
+    save(cal, args.out)
+    print(cal.describe())
+    print(f"\nWrote {args.out}")
+    print("The engine reads this file automatically; values marked (default) are")
+    print("unchanged because fewer than the minimum observations back them.")
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -684,6 +710,9 @@ def main():
     )
     parser.add_argument("--db", default="infinite_dj.db",
                         help="Path to SQLite database (default: infinite_dj.db)")
+    parser.add_argument("--calibration", metavar="PATH",
+                        help="Calibration file to use (default: ./calibration.json "
+                             "if present; built-in constants otherwise)")
 
     sub = parser.add_subparsers(dest="command")
 
@@ -816,7 +845,23 @@ def main():
                                "(default 0.5; rows are kept in the DB regardless)")
     p_corpus.add_argument("--json", help="Also write the stats to this JSON path")
 
+    p_cal = sub.add_parser(
+        "calibrate", help="Derive engine constants from the mined corpus")
+    p_cal.add_argument("--out", default="calibration.json",
+                       help="Calibration file to write (default calibration.json)")
+    p_cal.add_argument("--min-confidence", type=float, default=0.5,
+                       dest="min_confidence",
+                       help="Confidence floor for measurements used (default 0.5)")
+    p_cal.add_argument("--show", action="store_true",
+                       help="Print the current calibration and its provenance "
+                            "without rebuilding it")
+
     args = parser.parse_args()
+
+    # A calibration file is read automatically; this only overrides the path.
+    if getattr(args, "calibration", None):
+        from infinite_dj import calibration as _cal_mod
+        _cal_mod.set_active(_cal_mod.load(args.calibration))
 
     dispatch = {
         "analyze":    cmd_analyze,
@@ -834,6 +879,7 @@ def main():
         "mine":       cmd_mine,
         "probe":      cmd_probe,
         "corpus":     cmd_corpus,
+        "calibrate":  cmd_calibrate,
     }
 
     if args.command not in dispatch:
