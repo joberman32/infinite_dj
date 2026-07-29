@@ -954,6 +954,103 @@ def _match_entry(track: TrackMeta, target_energy: float,
                     energy=round(_energy_at(track, best), 3), confidence=0.5)
 
 
+@dataclass(frozen=True)
+class TransitionPlanned:
+    """
+    The decisions a transition needs, before any of them touch samples: where the
+    outgoing leaves, where the incoming enters, and how the crossfade is shaped.
+    """
+    cue_out: Optional[CuePoint]   # None when no scored OUT cue was available
+    cue_out_t: float              # seconds into the OUTGOING track
+    cue_in: CuePoint
+    cue_in_t: float               # seconds into the INCOMING track, downbeat-snapped
+    style: TransitionStyle
+    ratio: float                  # out_bpm / in_bpm, half/double folded
+    beatmatched: bool
+
+
+def plan_transition(
+    track_out: TrackMeta,
+    track_in: TrackMeta,
+    read_t: float,
+    dur_out: float,
+    *,
+    min_solo_bars: int = 32,
+    max_stretch: float = MAX_STRETCH,
+    sim_threshold: float = 0.82,
+    splice: Optional[tuple] = None,
+) -> TransitionPlanned:
+    """
+    Choose the exit cue, entry cue and crossfade style for one A→B transition.
+
+    Extracted from `render_set`'s loop so the same decisions can be replayed
+    outside a render — the corpus validator compares these against what real DJs
+    did, and the calibration report needs them without producing audio.
+
+    `read_t` is where the outgoing track is currently playing from and `dur_out`
+    the length of its *loaded* audio (which differs slightly from the analyzed
+    `duration`, so it has to be passed in rather than read off the TrackMeta).
+    `splice` is `(min_seg_sec, max_seg_sec)` for collage mode, else None.
+
+    Sample-domain clamping stays in the caller: it depends on the rendered buffer
+    length and, for the tail clamp, on the style this function returns.
+    """
+    out_bpm = track_out.bpm
+    out_bar_sec = (60.0 / out_bpm) * 4
+
+    # ── Tempo match: bring incoming to the OUTGOING track's native tempo ───────
+    ratios = [out_bpm / track_in.bpm,
+              out_bpm / (track_in.bpm * 2.0),
+              out_bpm / (track_in.bpm / 2.0)]
+    ratio = min(ratios, key=lambda r: abs(r - 1.0))
+    beatmatched = abs(ratio - 1.0) <= max_stretch
+
+    # ── Outgoing exit ─────────────────────────────────────────────────────────
+    if splice is not None:
+        min_seg_sec, max_seg_sec = splice
+        # Short segment: exit within [min_seg, max_seg] at a CLAP-serendipitous
+        # splice point that connects to the next track's texture.
+        min_exit_t = read_t + (min_seg_sec or 0.0)
+        max_exit_t = min(read_t + max_seg_sec, dur_out)
+        out_cue = _pick_splice_exit(track_out, track_in, min_exit_t, max_exit_t)
+        if out_cue is not None:
+            cue_out_t = out_cue.timestamp
+        else:
+            inwin = [d for d in track_out.downbeats if min_exit_t <= d <= max_exit_t]
+            cue_out_t = inwin[-1] if inwin else max(read_t, max_exit_t - out_bar_sec)
+    else:
+        # Breathe, then leave at a strong cue that still has a groove (so the
+        # outgoing carries a beat into the crossfade).
+        min_exit_t = read_t + min_solo_bars * out_bar_sec
+        out_cue = _pick_exit_cue(track_out, min_exit_t, dur_out)
+        if out_cue is not None:
+            cue_out_t = out_cue.timestamp
+        else:
+            later = [d for d in track_out.downbeats if min_exit_t <= d < dur_out]
+            cue_out_t = later[0] if later else max(read_t, dur_out - out_bar_sec)
+
+    # ── Incoming entry ────────────────────────────────────────────────────────
+    # Beat-locked transitions enter where the incoming groove matches the exit's
+    # energy (two rhythms lock); cuts just enter early.
+    target_e = out_cue.energy if out_cue else 0.5
+    if beatmatched:
+        in_cue = _match_entry(track_in, target_e)
+    else:
+        in_cue = _set_entry_cue(track_in) or CuePoint(0.0, "in", True, 0.5, 0.1)
+    cue_in_t = _find_nearest_downbeat(
+        in_cue.timestamp, track_in.downbeats,
+        max_offset=(60.0 / track_in.bpm) * 4 / 2.0,
+    )
+
+    # ── Pick a crossfade style from the two tracks' dynamics ──────────────────
+    style = choose_transition_style(out_cue, in_cue, beatmatched,
+                                    high_sim_threshold=sim_threshold)
+
+    return TransitionPlanned(cue_out=out_cue, cue_out_t=cue_out_t,
+                             cue_in=in_cue, cue_in_t=cue_in_t,
+                             style=style, ratio=ratio, beatmatched=beatmatched)
+
+
 def render_set(
     tracks: list,
     n_mix_bars: int = 16,
@@ -1020,53 +1117,19 @@ def render_set(
         cur_dur   = len(cur_audio) / sr
         read_t    = read / sr
 
-        # ── Tempo match: bring incoming to the OUTGOING track's native tempo ───
-        ratios = [out_bpm / nxt_t.bpm,
-                  out_bpm / (nxt_t.bpm * 2.0),
-                  out_bpm / (nxt_t.bpm / 2.0)]
-        ratio = min(ratios, key=lambda r: abs(r - 1.0))
-        beatmatched = abs(ratio - 1.0) <= max_stretch
-
-        # ── Outgoing exit ──────────────────────────────────────────────────────
-        if splice:
-            # Short segment: exit within [min_seg, max_seg] at a CLAP-serendipitous
-            # splice point that connects to the next track's texture.
-            min_exit_t = read_t + (min_seg_sec or 0.0)
-            max_exit_t = min(read_t + max_seg_sec, cur_dur)
-            out_cue = _pick_splice_exit(cur_t, nxt_t, min_exit_t, max_exit_t)
-            if out_cue is not None:
-                cue_out_t = out_cue.timestamp
-            else:
-                inwin = [d for d in cur_t.downbeats if min_exit_t <= d <= max_exit_t]
-                cue_out_t = inwin[-1] if inwin else max(read_t, max_exit_t - out_bar_sec)
-        else:
-            # Breathe, then leave at a strong cue that still has a groove (so the
-            # outgoing carries a beat into the crossfade).
-            min_exit_t = read_t + min_solo_bars * out_bar_sec
-            out_cue = _pick_exit_cue(cur_t, min_exit_t, cur_dur)
-            if out_cue is not None:
-                cue_out_t = out_cue.timestamp
-            else:
-                later = [d for d in cur_t.downbeats if min_exit_t <= d < cur_dur]
-                cue_out_t = later[0] if later else max(read_t, cur_dur - out_bar_sec)
-        cue_out_sample = max(read, _time_to_samples(cue_out_t, sr))
-        target_e = out_cue.energy if out_cue else 0.5
-
-        # ── Incoming entry ─────────────────────────────────────────────────────
-        # Beat-locked transitions enter where the incoming groove matches the
-        # exit's energy (two rhythms lock); cuts just enter early.
-        if beatmatched:
-            in_cue = _match_entry(nxt_t, target_e)
-        else:
-            in_cue = _set_entry_cue(nxt_t) or CuePoint(0.0, "in", True, 0.5, 0.1)
-        in_time = _find_nearest_downbeat(
-            in_cue.timestamp, nxt_t.downbeats, max_offset=(60.0 / nxt_t.bpm) * 4 / 2.0
+        # ── Cue + style selection (shared with the corpus validator) ───────────
+        planned = plan_transition(
+            cur_t, nxt_t, read_t, cur_dur,
+            min_solo_bars=min_solo_bars, max_stretch=max_stretch,
+            sim_threshold=sim_threshold,
+            splice=((min_seg_sec, max_seg_sec) if splice else None),
         )
-        in_sample = _time_to_samples(in_time, sr)
+        ratio, beatmatched = planned.ratio, planned.beatmatched
+        out_cue, cue_out_t = planned.cue_out, planned.cue_out_t
+        in_cue, style = planned.cue_in, planned.style
 
-        # ── Pick a crossfade style from the two tracks' dynamics ───────────────
-        style = choose_transition_style(out_cue, in_cue, beatmatched,
-                                        high_sim_threshold=sim_threshold)
+        cue_out_sample = max(read, _time_to_samples(cue_out_t, sr))
+        in_sample = _time_to_samples(planned.cue_in_t, sr)
 
         nxt_audio = load_matched(nxt_t)
         in_bar_s  = _time_to_samples((60.0 / nxt_t.bpm) * 4, sr)
