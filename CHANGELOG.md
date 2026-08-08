@@ -4,6 +4,48 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-08 — `fetch`: screened library expansion from the Internet Archive
+
+New `fetch_archive.py` and `dj.py fetch`. Downloads Creative Commons electronic
+music from the Archive's `netlabels` collection, screened *before* download
+against what the library is missing.
+
+**Why screening before download matters.** `gaps` established that engine
+behaviour is gated on library *composition*, not size: at 25 tracks spread over
+108–161 BPM, only 36% of pairs beatmatch and 64.5% of transitions come out as
+0.3s hard cuts. Bulk-fetching 24 hours of arbitrary electronic music would not
+fix that — 24 hours of equally-scattered tempos still cuts. What raises the
+beatmatchable fraction is tracks clustered near a tempo the library already has.
+
+**How it's possible.** Around 2014-15 the Archive ran Essentia over most of its
+audio and left the results beside each file: `<stem>_esshigh.json.gz` (genre and
+danceability classifiers, ~2 KB) and `<stem>_esslow.json.gz` (BPM, key,
+duration, ~24 KB). Screening a track therefore costs ~26 KB instead of the ~6 MB
+of downloading it and finding out. Checks run cheapest-first — license and
+listing duration are free, then the 2 KB genre file, then the 24 KB rhythm file
+only when a `--bpm` target makes it relevant — so most rejects cost 2 KB or
+nothing. `tests/test_fetch_archive.py` pins that ordering, because losing it
+turns a minutes-long screen into an hours-long one.
+
+`--from-gaps` closes the loop: it runs `library_gaps`, aims at the densest BPM
+cluster the library already has, and fetches only the shortfall to the target.
+That is the whole reason the two tools were built in this order.
+
+Notes and limits:
+
+- The Archive's BPM is a *screening hint only*. Nothing from Essentia enters the
+  track database; `analyze` re-derives everything from audio, as before.
+- Roughly half the netlabels corpus has no Essentia sidecars. Those tracks are
+  skipped by default (`--allow-unscreened` keeps them, unfiltered).
+- Every download appends to `PROVENANCE.jsonl` (source URL, creator, license).
+  CC-BY and friends require attribution to survive the copy. Items with no
+  declared license are skipped.
+- Much of the collection is `by-nc-nd`. Fine for private listening; a published
+  mix built from it is a derivative work. The plan output flags this, and
+  `--license` filters on the short code.
+- Tempo comparison folds to the engine's [90, 180) window, so a 63 BPM track
+  matches a 126 BPM target — the same octave the engine will see.
+
 ## 2026-08-08 — Library health: `triage` and `gaps`
 
 Two read-only reports over cached `TrackMeta` (no audio decoded), added while

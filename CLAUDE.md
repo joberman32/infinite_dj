@@ -49,6 +49,7 @@ python dj.py --db custom.db <command>   # override default DB path (infinite_dj.
 | `studio [--port N] [--out-dir DIR]` | Launch the studio: pick tracks/albums, set Serendipity + Pace, then either generate a fixed-length mix or start **RADIO** (endless, plays until you hit EXIT) |
 | `serve --audio file.wav [--timeline JSON] [--port N]` | Launch the web player for an already-rendered set |
 | `play [--start title] [--arc ...] [--out file.wav] [--duration N]` | Real-time playback |
+| `fetch [--from-gaps] [--bpm N] [--hours H] [--dry-run]` | Download screened Creative Commons tracks from the Internet Archive |
 | `triage [--grade G] [--json PATH]` | Grade each track on whether the engine can mix it well |
 | `gaps [--target-hours H] [--json PATH]` | What the library is missing, per the engine's real gates |
 | `mine <mix_dir> [--force]` | Mine DJ mixes + tracklist sidecars for calibration data |
@@ -77,8 +78,33 @@ infinite_dj/
 ├── mix_corpus.py        Tracklist parsing + corpus mining + distributions
 ├── calibration.py       Mined constants w/ provenance; falls back to defaults
 ├── validation.py        Engine-vs-corpus comparison + measurement ceiling
-└── library_health.py    Per-track triage + per-library gap report (metadata only)
+├── library_health.py    Per-track triage + per-library gap report (metadata only)
+└── fetch_archive.py     Screened CC downloads from the Internet Archive netlabels
 ```
+
+## Growing the library
+
+The loop is `gaps` → `fetch` → `analyze` → `triage` → `gaps`:
+
+```bash
+python dj.py gaps                                  # what's missing, per the engine's gates
+python dj.py fetch --from-gaps --dry-run           # what that means as a shopping list
+python dj.py fetch --from-gaps                     # download it
+python dj.py analyze music/archive                 # the engine's own analysis, from audio
+python dj.py triage --grade reject                 # what didn't survive
+```
+
+`fetch` screens against the Archive's own Essentia sidecars (BPM, key, genre,
+danceability — published beside each file) so a `--bpm` target costs ~26 KB per
+track to evaluate instead of ~6 MB. Checks run cheapest-first and
+`tests/test_fetch_archive.py` pins that ordering.
+
+Screening is a *filter*, not analysis: nothing from Essentia reaches the track
+database. `analyze` re-derives BPM, key, cues and grid from the audio, as always.
+
+Downloads append attribution to `PROVENANCE.jsonl` in the destination. Much of
+the netlabels collection is `by-nc-nd` — fine for listening, not for publishing
+a mix built from it; use `--license` to filter.
 
 ## Calibration from real DJ mixes
 

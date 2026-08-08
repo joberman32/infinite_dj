@@ -826,6 +826,176 @@ def cmd_gaps(args):
         print(f"\nWrote {args.json}")
 
 
+def cmd_fetch(args):
+    """Screen and download Creative Commons tracks from the Internet Archive."""
+    from infinite_dj import fetch_archive as fa
+
+    # argparse's `append` action can't carry a default without appending to it.
+    args.source = args.source or ["house", "techno"]
+    args.genre  = args.genre  or ["house", "techno"]
+
+    spec = fa.Screen(
+        bpm_center=args.bpm, bpm_tol=args.bpm_tol,
+        min_duration=args.min_duration, max_duration=args.max_duration,
+        genres=tuple(args.genre), min_genre_prob=args.min_genre_prob,
+        min_danceability=args.min_danceability,
+        allow_unscreened=args.allow_unscreened,
+        licenses=tuple(args.license.split(",")) if args.license else None,
+    )
+    target_hours = args.hours
+
+    # `--from-gaps` turns the gap report into the shopping list: aim at the
+    # densest BPM cluster the library already has (that's where new tracks buy
+    # the most beatmatchable pairs) and fetch only the shortfall.
+    if args.from_gaps:
+        from infinite_dj.library_health import library_gaps
+        db = TrackDB(args.db)
+        tracks = db.load_all()
+        db.close()
+        if len(tracks) < 2:
+            print("--from-gaps needs an analyzed library. Run `analyze` first.")
+            return
+        g = library_gaps(tracks, target_hours=args.gap_target_hours)
+        if spec.bpm_center is None and g.bpm_clusters:
+            spec.bpm_center = g.bpm_clusters[0][0]
+        target_hours = max(0.0, g.target_hours - g.total_hours)
+        print(f"From gaps: {g.total_hours:.1f}h of {g.target_hours:.0f}h, "
+              f"{g.beatmatchable_frac:.0%} beatmatchable")
+        if spec.bpm_center:
+            print(f"  targeting {spec.bpm_center:.0f} BPM "
+                  f"(±{spec.bpm_tol:.0f}) — the library's densest cluster")
+
+    if target_hours <= 0:
+        print("Nothing to fetch — the target is already met.")
+        return
+
+    queries = [fa.PRESETS[s] for s in args.source]
+    have = fa.existing_sources(args.out)
+    print(f"Screening the Archive for {target_hours:.1f}h "
+          f"({', '.join(args.source)}); {len(have)} files already fetched.")
+    print("Reading Essentia sidecars, not audio — this costs ~26 KB per track.\n")
+
+    def progress(plan, ident):
+        print(f"\r  {plan.items_seen:4d} releases · {plan.tracks_seen:5d} tracks "
+              f"seen · {len(plan.keep):4d} kept · {plan.hours:5.2f}h   ",
+              end="", flush=True)
+
+    plan = fa.build_plan(queries, spec, target_hours=target_hours,
+                         max_items=args.max_items, have=have,
+                         workers=args.workers,
+                         max_bytes=int(args.max_gb * 1024 ** 3),
+                         progress=progress)
+    print()
+
+    _print_plan(plan, spec)
+    _print_yield_advice(plan, spec, target_hours, args)
+
+    if not plan.keep:
+        print("\nNothing survived screening — see the advice above.")
+        return
+    if args.dry_run:
+        print("\n(dry run — nothing downloaded). Drop --dry-run to fetch.")
+        return
+
+    print(f"\nDownloading {len(plan.keep)} files "
+          f"({plan.bytes / 1024 ** 3:.2f} GB) to {args.out}/ ...")
+    ok = skipped = failed = 0
+    for i, cand in enumerate(plan.keep, 1):
+        try:
+            dest, fetched = fa.download(cand, args.out)
+        except Exception as e:
+            failed += 1
+            print(f"\r  [{i}/{len(plan.keep)}] FAILED {cand.filename}: {e}")
+            continue
+        if fetched:
+            fa.record_provenance(args.out, cand, dest)
+            ok += 1
+        else:
+            skipped += 1
+        print(f"\r  [{i}/{len(plan.keep)}] {ok} new, {skipped} present, "
+              f"{failed} failed", end="", flush=True)
+    print(f"\n\n{ok} files written to {args.out}/")
+    print(f"Attribution recorded in {os.path.join(args.out, 'PROVENANCE.jsonl')}")
+    print(f"\nNext:  python dj.py --db {args.db} analyze {args.out}")
+    print(f"       python dj.py --db {args.db} triage --grade reject")
+    print(f"       python dj.py --db {args.db} gaps")
+
+
+def _print_plan(plan, spec):
+    """Show what screening kept and, just as usefully, what it threw away."""
+    from infinite_dj.fetch_archive import _license_code, fold_bpm
+
+    if plan.keep:
+        print(f"\nKEEPING {len(plan.keep)} tracks · {plan.hours:.2f}h · "
+              f"{plan.bytes / 1024 ** 3:.2f} GB")
+        licenses, genres = {}, {}
+        for c in plan.keep:
+            code = _license_code(c.license)
+            licenses[code] = licenses.get(code, 0) + 1
+            if c.genre:
+                genres[c.genre] = genres.get(c.genre, 0) + 1
+        if genres:
+            print("  genres  : " + ", ".join(
+                f"{k} {v}" for k, v in sorted(genres.items(), key=lambda x: -x[1])))
+        print("  licenses: " + ", ".join(
+            f"{k or 'none'} {v}" for k, v in sorted(licenses.items(), key=lambda x: -x[1])))
+        if any("nd" in (k or "").split("-") for k in licenses):
+            print("  note    : NoDerivatives (-nd) tracks are fine to listen to, "
+                  "but a published mix built from them is a derivative work.")
+        # "top" is the classifier's argmax; "match" is the summed probability of
+        # the genres asked for, which is what actually let the track through.
+        print(f"\n  {'BPM':>6}  {'top genre':<10} {'match':>5}  "
+              f"{'Artist':<24} Title")
+        for c in plan.keep[:15]:
+            bpm = f"{fold_bpm(c.bpm):.0f}" if c.bpm else "—"
+            print(f"  {bpm:>6}  {c.genre[:10]:<10} {c.target_prob:>5.2f}  "
+                  f"{(c.artist or c.creator)[:24]:<24} {c.track_title[:32]}")
+        if len(plan.keep) > 15:
+            print(f"  … and {len(plan.keep) - 15} more")
+
+    if plan.rejected:
+        print(f"\nSCREENED OUT ({plan.tracks_seen} tracks across "
+              f"{plan.items_seen} releases)")
+        for reason, n in sorted(plan.rejected.items(), key=lambda x: -x[1]):
+            print(f"  {n:5d}  {reason}")
+
+
+def _print_yield_advice(plan, spec, target_hours, args):
+    """
+    A run that stops short did so because the release budget ran out, not
+    because the Archive is empty. Say which screen was the binding constraint
+    and what to relax, since the yield is the thing that decides whether 24
+    hours takes one run or twenty.
+    """
+    if plan.hours >= target_hours or not plan.items_seen:
+        return
+
+    print(f"\nYIELD: {plan.hours:.2f}h of the {target_hours:.1f}h asked for "
+          f"— screened {args.max_items} releases per source and ran out.")
+    if plan.tracks_seen:
+        per = plan.hours / plan.items_seen
+        need = (target_hours - plan.hours) / per if per > 0 else float("inf")
+        print(f"  At this yield, the rest needs ~{need:.0f} more releases "
+              f"screened. Raise --max-items.")
+
+    top = sorted(plan.rejected.items(), key=lambda x: -x[1])
+    hints = {
+        "no Essentia data": "much of the collection predates the Archive's "
+                            "analysis pass — --allow-unscreened keeps those, "
+                            "but then --bpm can't filter them",
+        "off-tempo": f"--bpm-tol {spec.bpm_tol:.0f} is tight; try a wider "
+                     f"window or a --bpm the netlabel corpus has more of "
+                     f"(it skews 120-130)",
+        "wrong subgenre": "lower --min-genre-prob, or add --genre "
+                          "trance/ambient/dnb",
+        "duration": "adjust --min-duration / --max-duration",
+        "item unreadable": "Archive timeouts — usually transient; re-run",
+    }
+    for reason, n in top[:2]:
+        if reason in hints and n > plan.tracks_seen * 0.15:
+            print(f"  Biggest loss: {reason} ({n}) — {hints[reason]}")
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -870,6 +1040,58 @@ def main():
                         dest="target_hours",
                         help="Library size goal in hours (default 24)")
     p_gaps.add_argument("--json", help="Also write the report to this JSON path")
+
+    # fetch
+    p_fetch = sub.add_parser(
+        "fetch",
+        help="Download screened Creative Commons tracks from the Internet Archive")
+    p_fetch.add_argument("--out", default="music/archive",
+                         help="Destination directory (default music/archive)")
+    p_fetch.add_argument("--hours", type=float, default=2.0,
+                         help="Hours of audio to fetch this run (default 2)")
+    p_fetch.add_argument("--from-gaps", action="store_true", dest="from_gaps",
+                         help="Target the library's densest BPM cluster and "
+                              "fetch its shortfall, per the `gaps` report")
+    p_fetch.add_argument("--gap-target-hours", type=float, default=24.0,
+                         dest="gap_target_hours",
+                         help="Library size goal used by --from-gaps (default 24)")
+    p_fetch.add_argument("--source", action="append",
+                         choices=sorted(("house", "techno", "experimental",
+                                         "electronic")),
+                         help="Search preset (repeatable; default house+techno)")
+    p_fetch.add_argument("--bpm", type=float,
+                         help="Target tempo; only tracks within --bpm-tol are kept")
+    p_fetch.add_argument("--bpm-tol", type=float, default=8.0, dest="bpm_tol",
+                         help="Tempo tolerance in BPM (default 8)")
+    p_fetch.add_argument("--genre", action="append",
+                         choices=["ambient", "dnb", "house", "techno", "trance"],
+                         help="Essentia sub-genre to accept (repeatable; "
+                              "default house+techno)")
+    p_fetch.add_argument("--min-genre-prob", type=float, default=0.25,
+                         dest="min_genre_prob",
+                         help="Minimum summed probability for --genre (default 0.25)")
+    p_fetch.add_argument("--min-danceability", type=float, default=0.0,
+                         dest="min_danceability",
+                         help="Minimum Essentia danceability, 0-1 (default 0, off)")
+    p_fetch.add_argument("--min-duration", type=float, default=150.0,
+                         dest="min_duration", help="Seconds (default 150)")
+    p_fetch.add_argument("--max-duration", type=float, default=900.0,
+                         dest="max_duration",
+                         help="Seconds (default 900 — longer is usually a DJ mix)")
+    p_fetch.add_argument("--license", metavar="CODES",
+                         help="Comma-separated allowlist, e.g. by,by-sa,by-nc-sa. "
+                              "Default: any declared CC license")
+    p_fetch.add_argument("--allow-unscreened", action="store_true",
+                         dest="allow_unscreened",
+                         help="Keep tracks with no Essentia data (unfiltered)")
+    p_fetch.add_argument("--max-items", type=int, default=400, dest="max_items",
+                         help="Releases to screen per source (default 400)")
+    p_fetch.add_argument("--max-gb", type=float, default=20.0, dest="max_gb",
+                         help="Hard download ceiling in GB (default 20)")
+    p_fetch.add_argument("--workers", type=int, default=6,
+                         help="Concurrent screening requests (default 6)")
+    p_fetch.add_argument("--dry-run", action="store_true", dest="dry_run",
+                         help="Screen and print the plan without downloading")
 
     # inspect
     p_inspect = sub.add_parser("inspect", help="Full details for one track")
@@ -1037,6 +1259,7 @@ def main():
 
     dispatch["triage"] = cmd_triage
     dispatch["gaps"]   = cmd_gaps
+    dispatch["fetch"]  = cmd_fetch
 
     if args.command not in dispatch:
         parser.print_help()
