@@ -49,6 +49,8 @@ python dj.py --db custom.db <command>   # override default DB path (infinite_dj.
 | `studio [--port N] [--out-dir DIR]` | Launch the studio: pick tracks/albums, set Serendipity + Pace, then either generate a fixed-length mix or start **RADIO** (endless, plays until you hit EXIT) |
 | `serve --audio file.wav [--timeline JSON] [--port N]` | Launch the web player for an already-rendered set |
 | `play [--start title] [--arc ...] [--out file.wav] [--duration N]` | Real-time playback |
+| `triage [--grade G] [--json PATH]` | Grade each track on whether the engine can mix it well |
+| `gaps [--target-hours H] [--json PATH]` | What the library is missing, per the engine's real gates |
 | `mine <mix_dir> [--force]` | Mine DJ mixes + tracklist sidecars for calibration data |
 | `probe <mix> --idx N` | Full measurement detail for one mined boundary (debugging view) |
 | `corpus [--min-confidence F] [--json PATH]` | Mined distributions + rejection-bias report |
@@ -74,7 +76,8 @@ infinite_dj/
 ├── transition_probe.py  Measures one transition from mix audio alone (I/O-free DSP)
 ├── mix_corpus.py        Tracklist parsing + corpus mining + distributions
 ├── calibration.py       Mined constants w/ provenance; falls back to defaults
-└── validation.py        Engine-vs-corpus comparison + measurement ceiling
+├── validation.py        Engine-vs-corpus comparison + measurement ceiling
+└── library_health.py    Per-track triage + per-library gap report (metadata only)
 ```
 
 ## Calibration from real DJ mixes

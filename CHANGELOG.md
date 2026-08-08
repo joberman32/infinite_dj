@@ -4,6 +4,36 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-08 — Library health: `triage` and `gaps`
+
+Two read-only reports over cached `TrackMeta` (no audio decoded), added while
+planning a library expansion from 25 tracks to ~24 hours. New
+`library_health.py`, `dj.py triage`, `dj.py gaps`.
+
+- `triage` grades each track `good`/`usable`/`reject` on whether the engine can
+  mix it: tempo confidence, downbeat count, beat-grid coverage of the audio,
+  cue availability, duration, octave-fold edge cases. Hard failures reject;
+  weak-but-workable ones stay. **Documented blind spot:** the stored grid is
+  equidistant *by construction* (`_refine_tempo_phase` lays it down with
+  `arange`), so a confidently-wrong tempo grades `good`. Only ears catch that,
+  and `test_a_confidently_wrong_grid_is_invisible` pins the limitation so it
+  isn't mistaken for a bug.
+- `gaps` reports the library against the engine's *real* gates rather than
+  against size. It calls `choose_transition_style` on sampled pairs instead of
+  reimplementing its logic, so style reachability can't drift from the mixer.
+  The two energy thresholds it does duplicate (0.45 / 0.70) are pinned by
+  `test_gap_thresholds_mirror_the_mixer_gates`, which greps the mixer source.
+- **First run surfaced two findings that reframe the transition-monotony work:**
+  on the 25-track library, **64.5% of sampled pairs produce `cut`** (tempo
+  scatter across 108–161 BPM, only 36% beatmatchable), and **`swap` is
+  unreachable at 0%** while `fade` sits at 2.2%. So the engine is mostly making
+  hard cuts, and of the real crossfades only `blend` and `build` fire in
+  practice. `swap` requires both cue energies > 0.70, but `cue_detector`'s OUT
+  scoring explicitly rewards energy *valleys* (`energy_valley×2.5`,
+  `low_absolute_energy×0.5`), so the strongest OUT cue is systematically
+  low-energy — the two components work against each other by construction.
+- Reports are advisory only. Nothing filters the library or changes rendering.
+
 ## 2026-07-29 — Corpus mining and calibration (Phase 1)
 
 Full results and the Phase 2 recommendation are in [CALIBRATION.md](CALIBRATION.md).

@@ -737,6 +737,95 @@ def cmd_validate(args):
         print(f"\nWrote {args.json}")
 
 
+def cmd_triage(args):
+    """Grade every analyzed track on whether the engine can mix it well."""
+    from infinite_dj.library_health import triage
+
+    db = TrackDB(args.db)
+    tracks = db.load_all()
+    db.close()
+
+    if not tracks:
+        print("No tracks in database. Run `analyze` first.")
+        return
+
+    reports = triage(tracks)
+    if args.grade:
+        reports = [r for r in reports if r.grade == args.grade]
+
+    counts = {"good": 0, "usable": 0, "reject": 0}
+    for r in triage(tracks):
+        counts[r.grade] += 1
+
+    print(f"\n{'Grade':<8} {'Title':<38} {'BPM':<7} {'Conf':<6} {'Why'}")
+    print("─" * 100)
+    for r in reports:
+        title = r.title[:36] + ".." if len(r.title) > 38 else r.title
+        why = "; ".join(r.reasons)[:44] if r.reasons else "—"
+        print(f"{r.grade:<8} {title:<38} {r.bpm:<7.1f} {r.bpm_confidence:<6.2f} {why}")
+
+    total = sum(counts.values())
+    print("─" * 100)
+    print(f"{total} tracks: {counts['good']} good, "
+          f"{counts['usable']} usable, {counts['reject']} reject")
+    if counts["reject"]:
+        print("\nRejects can't be mixed sensibly — too short, too few cues, or "
+              "a tempo the analyzer wasn't sure about.")
+    print("Note: a confidently-WRONG beat grid looks fine here. Only ears catch that.")
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump([r.__dict__ for r in reports], fh, indent=2)
+        print(f"\nWrote {args.json}")
+
+
+def cmd_gaps(args):
+    """Report what the library is missing, against the engine's real gates."""
+    from infinite_dj.library_health import library_gaps
+
+    db = TrackDB(args.db)
+    tracks = db.load_all()
+    db.close()
+
+    if len(tracks) < 2:
+        print("Need at least 2 analyzed tracks. Run: python dj.py analyze <dir>")
+        return
+
+    g = library_gaps(tracks, target_hours=args.target_hours)
+
+    print(f"\nLIBRARY: {g.n_tracks} tracks, {g.total_hours:.2f}h "
+          f"(target {g.target_hours:.0f}h)")
+    print(f"  beatmatchable pairs : {g.beatmatchable_frac:.0%}")
+    print(f"  Camelot coverage    : {g.camelot_coverage}/24 keys")
+    print(f"  energy extremes     : {g.low_energy_tracks} low, "
+          f"{g.high_energy_tracks} high")
+
+    if g.bpm_clusters:
+        print("\nBPM CLUSTERS")
+        for centre, n in g.bpm_clusters:
+            print(f"  {centre:6.1f} BPM   {'█' * min(n, 40)} {n}")
+
+    print("\nTRANSITION STYLES REACHABLE")
+    total = sum(g.style_counts.values()) or 1
+    for name in ("blend", "swap", "fade", "build", "cut"):
+        n = g.style_counts.get(name, 0)
+        bar = "█" * int(40 * n / total)
+        flag = "  ← UNREACHABLE" if n == 0 else ""
+        print(f"  {name:<7} {bar:<40} {n / total:5.1%}{flag}")
+
+    if g.findings:
+        print("\nWHAT TO FIX")
+        for f in g.findings:
+            print(f"  • {f}")
+    else:
+        print("\nNo gaps found — this library exercises the whole engine.")
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(g.__dict__, fh, indent=2)
+        print(f"\nWrote {args.json}")
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -766,6 +855,21 @@ def main():
 
     # library
     sub.add_parser("library", help="List all analyzed tracks")
+
+    # triage
+    p_triage = sub.add_parser(
+        "triage", help="Grade each track on whether the engine can mix it well")
+    p_triage.add_argument("--grade", choices=["good", "usable", "reject"],
+                          help="Show only tracks with this grade")
+    p_triage.add_argument("--json", help="Also write the report to this JSON path")
+
+    # gaps
+    p_gaps = sub.add_parser(
+        "gaps", help="Report what the library is missing, per the engine's gates")
+    p_gaps.add_argument("--target-hours", type=float, default=24.0,
+                        dest="target_hours",
+                        help="Library size goal in hours (default 24)")
+    p_gaps.add_argument("--json", help="Also write the report to this JSON path")
 
     # inspect
     p_inspect = sub.add_parser("inspect", help="Full details for one track")
@@ -930,6 +1034,9 @@ def main():
         "calibrate":  cmd_calibrate,
         "validate":   cmd_validate,
     }
+
+    dispatch["triage"] = cmd_triage
+    dispatch["gaps"]   = cmd_gaps
 
     if args.command not in dispatch:
         parser.print_help()
