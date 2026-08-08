@@ -20,6 +20,18 @@ The gap report exists because the engine's behaviour is gated on library
 both cue energies are below `BLEND_MAX_ENERGY`, and only returns `swap` when
 both are above `SWAP_MIN_ENERGY` — so a library with no energy extremes can
 never produce two of the four styles, no matter what the mixer does.
+
+**The gap report must plan, not re-implement.** An earlier version called
+`choose_transition_style` directly on `best_cue_out` / `best_cue_in`, which are
+the *globally* strongest cues. `render_set` does not use those. It uses
+`plan_transition`, which picks the exit with `_pick_exit_cue` (a `groove_floor`
+that rejects dead-valley exits) and the entry with `_match_entry` (which
+searches downbeats for energy matching the exit, not the scored IN cues).
+Measured on the 25-track library, the two disagree badly: median exit energy
+0.15 via `best_cue_out` against 0.51 via the planner, which reported `swap`
+as unreachable when it actually fires on 6.3% of pairs. So this module calls
+`plan_transition` and reads the styles back off it. Anything that predicts
+engine behaviour by re-deriving it will drift from the engine.
 """
 
 from __future__ import annotations
@@ -144,8 +156,8 @@ class GapReport:
     beatmatchable_frac: float
     bpm_clusters: List[tuple]          # (centre_bpm, n_tracks)
     camelot_coverage: int              # distinct keys present (of 24)
-    low_energy_tracks: int             # have a cue under BLEND_MAX_ENERGY
-    high_energy_tracks: int            # have a cue over SWAP_MIN_ENERGY
+    low_energy_tracks: int             # planner exits them under BLEND_MAX_ENERGY
+    high_energy_tracks: int            # planner exits them over SWAP_MIN_ENERGY
     style_counts: dict                 # style name -> reachable pair count
     findings: List[str] = field(default_factory=list)
 
@@ -180,7 +192,7 @@ def library_gaps(tracks: List, target_hours: float = 24.0,
     `max_pairs` bounds the pairwise style simulation: it samples evenly rather
     than running every ordered pair on a large library.
     """
-    from .mixer import MAX_STRETCH, choose_transition_style
+    from .mixer import MAX_STRETCH, plan_transition
 
     n = len(tracks)
     total_h = sum(float(t.duration or 0.0) for t in tracks) / 3600.0
@@ -195,21 +207,24 @@ def library_gaps(tracks: List, target_hours: float = 24.0,
     n_bm = sum(1 for a, b in sampled if _beatmatchable(a.bpm, b.bpm, MAX_STRETCH))
     bm_frac = n_bm / len(sampled) if sampled else 0.0
 
-    # Style reachability: call the real chooser so this can't drift from it.
+    # Style reachability: run the real planner, not a re-derivation of it. The
+    # exit cue it picks is not the globally strongest one, and the entry cue it
+    # picks depends on the exit — neither is recoverable from the cue list alone.
     style_counts: dict = {}
+    exit_energy: dict = {}          # file_path -> the exit energy the planner chose
     for a, b in sampled:
-        out_c = _strongest(a, "out")
-        in_c  = _strongest(b, "in")
-        if out_c is None or in_c is None:
-            continue
-        bm = _beatmatchable(a.bpm, b.bpm, MAX_STRETCH)
-        name = choose_transition_style(out_c, in_c, bm).name
-        style_counts[name] = style_counts.get(name, 0) + 1
+        try:
+            plan = plan_transition(a, b, read_t=0.0, dur_out=a.duration or 0.0)
+        except Exception:
+            continue                # a track too broken to plan is triage's problem
+        style_counts[plan.style.name] = style_counts.get(plan.style.name, 0) + 1
+        if plan.cue_out is not None:
+            # `_pick_exit_cue` reads only the outgoing track, so this is a
+            # property of `a` alone and is stable across every pair using it.
+            exit_energy[a.file_path] = plan.cue_out.energy
 
-    lo = sum(1 for t in tracks
-             if any(c.energy < BLEND_MAX_ENERGY for c in (t.cue_points or [])))
-    hi = sum(1 for t in tracks
-             if any(c.energy > SWAP_MIN_ENERGY for c in (t.cue_points or [])))
+    lo = sum(1 for e in exit_energy.values() if e < BLEND_MAX_ENERGY)
+    hi = sum(1 for e in exit_energy.values() if e > SWAP_MIN_ENERGY)
     keys = {t.key for t in tracks if getattr(t, "key", None)}
     clusters = _cluster_bpms(bpms)
 
@@ -220,21 +235,29 @@ def library_gaps(tracks: List, target_hours: float = 24.0,
         findings.append(
             f"{need:.1f}h short of {target_hours:.0f}h "
             f"(~{int(need * 60 / max(avg_min, 0.1))} more tracks at {avg_min:.1f} min avg)")
-    if bm_frac < 0.30:
+    # Report the cut share, not the beatmatchable fraction. They are the same
+    # number (a cut fires exactly when tempos clash), but one is a statistic and
+    # the other is what you hear: a 0.3s hard cut where a crossfade should be.
+    # The old `bm_frac < 0.30` gate stayed silent at 36% beatmatchable — i.e.
+    # while two thirds of all transitions were cuts.
+    total_styles = sum(style_counts.values())
+    cut_frac = style_counts.get("cut", 0) / total_styles if total_styles else 0.0
+    if cut_frac >= 0.40:
+        where = (f"; add tracks near {clusters[0][0]:.0f} BPM, where the library "
+                 f"is already densest" if clusters else "")
         findings.append(
-            f"only {bm_frac:.0%} of pairs beatmatch — most transitions will be "
-            f"hard cuts; add tracks near {clusters[0][0]:.0f} BPM" if clusters
-            else f"only {bm_frac:.0%} of pairs beatmatch")
+            f"{cut_frac:.0%} of transitions are hard cuts, not crossfades — "
+            f"only {bm_frac:.0%} of pairs beatmatch{where}")
     for style in ("blend", "swap", "fade", "build"):
         if style_counts.get(style, 0) == 0:
             findings.append(f"style '{style}' is unreachable — no pair triggers it")
     if lo < max(3, n // 10):
         findings.append(
-            f"only {lo} tracks have a cue below {BLEND_MAX_ENERGY} energy — "
+            f"only {lo} tracks exit below {BLEND_MAX_ENERGY} energy — "
             "long smooth blends will be rare")
     if hi < max(3, n // 10):
         findings.append(
-            f"only {hi} tracks have a cue above {SWAP_MIN_ENERGY} energy — "
+            f"only {hi} tracks exit above {SWAP_MIN_ENERGY} energy — "
             "drop-to-drop swaps will be rare")
     if len(keys) < 12:
         findings.append(
@@ -250,7 +273,17 @@ def library_gaps(tracks: List, target_hours: float = 24.0,
 
 
 def _strongest(track, cue_type: str):
-    """Highest-confidence cue of a type, which is what the mixer prefers."""
+    """
+    Highest-confidence cue of a type — i.e. `mixer.best_cue_out` /
+    `best_cue_in`.
+
+    Kept for callers that want the globally strongest cue, but NOT used by the
+    gap report: the set renderer picks exits through `_pick_exit_cue` and
+    entries through `_match_entry`, and on the reference library this function
+    disagrees with those badly enough to invert a conclusion (see the module
+    docstring). Reach for `plan_transition` when the question is "what will the
+    engine do".
+    """
     cues = [c for c in (getattr(track, "cue_points", None) or [])
             if c.type == cue_type]
     return max(cues, key=lambda c: c.confidence) if cues else None

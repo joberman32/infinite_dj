@@ -135,6 +135,27 @@ def test_gap_thresholds_mirror_the_mixer_gates():
     assert f"> {SWAP_MIN_ENERGY}" in src, "swap gate moved in mixer.py"
 
 
+def test_the_gap_report_plans_rather_than_re_deriving():
+    """
+    The report must go through `plan_transition`. An earlier version called
+    `choose_transition_style` on `best_cue_out` / `best_cue_in`, which the set
+    renderer never uses: measured on the 25-track library, that pairing put
+    median exit energy at 0.15 against the planner's 0.51, and reported `swap`
+    unreachable when it really fires on 6.3% of pairs.
+
+    If this ever needs to change, re-measure both paths first — the two answers
+    differ enough to invert a conclusion.
+    """
+    import inspect
+
+    src = inspect.getsource(library_gaps)
+    assert "plan_transition" in src
+    assert "choose_transition_style" not in src, \
+        "the gap report must not re-derive style selection"
+    assert "_strongest" not in src, \
+        "the globally strongest cue is not the one the renderer exits on"
+
+
 def test_unreachable_style_is_reported():
     """A library of only mid-energy cues can never trigger blend or swap."""
     tracks = [_track(title=f"t{i}", bpm=128.0, cue_energy=0.55) for i in range(4)]
@@ -150,8 +171,24 @@ def test_tempo_scattered_library_reports_low_beatmatch():
               for i, bpm in enumerate([95.0, 118.0, 137.0, 162.0])]
     g = library_gaps(tracks, target_hours=1.0)
     assert g.beatmatchable_frac == 0.0
-    assert any("beatmatch" in f for f in g.findings)
     assert g.style_counts.get("cut", 0) > 0
+    cut = [f for f in g.findings if "hard cuts" in f]
+    assert cut, g.findings
+    assert "100%" in cut[0], "the cut share is the number worth leading with"
+
+
+def test_a_mostly_cutting_library_is_flagged_even_when_some_pairs_match():
+    """
+    Regression: the finding used to key off `beatmatchable_frac < 0.30`, which
+    stayed silent on the reference library at 36% beatmatchable — while 64.5%
+    of its transitions were hard cuts. The share that matters is the one you
+    hear, and it is the complement.
+    """
+    tracks = [_track(title=f"t{i}", bpm=bpm)
+              for i, bpm in enumerate([126.0, 127.0, 128.0, 129.0, 150.0, 95.0])]
+    g = library_gaps(tracks, target_hours=1.0)
+    assert 0.30 < g.beatmatchable_frac < 0.50, g.beatmatchable_frac
+    assert any("hard cuts" in f for f in g.findings), g.findings
 
 
 def test_dense_cluster_reports_high_beatmatch():

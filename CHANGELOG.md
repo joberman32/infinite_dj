@@ -4,6 +4,58 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-08 — `gaps` now plans instead of re-deriving (corrects a wrong finding)
+
+`library_gaps` predicted transition styles by calling `choose_transition_style`
+on `best_cue_out` / `best_cue_in`. The set renderer never uses those. It goes
+through `plan_transition`, which picks the exit with `_pick_exit_cue` (a
+`groove_floor=0.4` that rejects dead-valley exits) and the entry with
+`_match_entry` (which searches the incoming track's *downbeats* for energy
+matching the exit, rather than using the low-energy scored IN cues).
+
+Measured over all 600 ordered pairs of the 25-track library:
+
+| | via `best_cue_out`/`best_cue_in` | via `plan_transition` |
+|---|---|---|
+| median exit energy | 0.15 | **0.51** |
+| exits above the 0.70 swap gate | 0% | **16%** |
+| `swap` | 0.0% — "unreachable" | **6.3%** |
+| `fade` | 2.2% | **10.2%** |
+| `blend` | 18.0% | 5.7% |
+| `cut` | 64.5% | 64.5% |
+
+**The "`swap` is unreachable" finding was an artifact of the report, not a
+property of the engine.** All four crossfade styles fire. The reasoning behind
+it was sound in isolation — `cue_detector` does reward energy valleys in OUT
+scoring — but `_pick_exit_cue` already compensates, which is invisible if you
+read the cue list instead of running the planner. Anything predicting engine
+behaviour by re-deriving it will drift from the engine; `plan_transition` was
+extracted precisely so callers don't have to. A test now pins that
+`library_gaps` calls it and mentions neither `choose_transition_style` nor
+`_strongest`.
+
+Two consequences:
+
+- `low_energy_tracks` / `high_energy_tracks` now count tracks by the exit energy
+  the planner actually selects, not by whether any cue anywhere clears a gate.
+  On the reference library that moved 25 low / 21 high to 7 low / 4 high.
+- The headline finding is now the **cut share** rather than `beatmatchable_frac`.
+  They are the same number — a cut fires exactly when tempos clash — but the old
+  `bm_frac < 0.30` gate stayed silent at 36% beatmatchable, i.e. while 64.5% of
+  transitions were hard cuts. The report was failing to mention the single most
+  audible fact about the library.
+
+Separately measured and worth recording, since it bears on the transition
+variance work: `fade` vs `build` is decided by `eo >= ei`, and covers 141 of the
+213 beatmatched pairs. But `_match_entry` picks the entry cue by *minimizing*
+`|eo - ei|`. Median margin at that branch is **0.055**, with 46% of pairs inside
+0.05 and 12% inside 0.01. The engine equalizes the two energies and then
+branches on the sign of the difference it just equalized, so for two thirds of
+all crossfades the style choice carries almost no musical signal. That is an
+argument *for* the seeded-variance design rather than against it: replacing a
+coin flip on noise with a deliberate, reproducible choice is a strict
+improvement.
+
 ## 2026-08-08 — `fetch`: screened library expansion from the Internet Archive
 
 New `fetch_archive.py` and `dj.py fetch`. Downloads Creative Commons electronic

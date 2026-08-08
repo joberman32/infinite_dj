@@ -102,6 +102,13 @@ track to evaluate instead of ~6 MB. Checks run cheapest-first and
 Screening is a *filter*, not analysis: nothing from Essentia reaches the track
 database. `analyze` re-derives BPM, key, cues and grid from the audio, as always.
 
+⚠ **To predict what the engine will do, call `plan_transition` — never re-derive
+it.** `gaps` originally called `choose_transition_style` on `best_cue_out` /
+`best_cue_in`, which the set renderer never uses (it exits via `_pick_exit_cue`,
+with a groove floor, and enters via `_match_entry`, which energy-matches the
+exit). That put median exit energy at 0.15 instead of 0.51 and reported `swap`
+as unreachable when it fires on 6.3% of pairs. See CHANGELOG.
+
 Downloads append attribution to `PROVENANCE.jsonl` in the destination. Much of
 the netlabels collection is `by-nc-nd` — fine for listening, not for publishing
 a mix built from it; use `--license` to filter.
