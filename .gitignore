@@ -10,6 +10,12 @@ env/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak-*
+
+# The audio library itself. `fetch` writes a few GB here, and PROVENANCE.jsonl
+# is not covered by the audio extensions below — without this, `git add .` in a
+# freshly-fetched checkout stages the whole collection.
+music/
 
 # Rendered audio output
 *.wav

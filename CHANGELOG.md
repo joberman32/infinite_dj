@@ -4,6 +4,47 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-09 — the library is no longer the bottleneck (first bulk `fetch`)
+
+Ran the `gaps → fetch → analyze → triage → gaps` loop for real. `fetch
+--from-gaps` targeted 135 BPM ±8 (the densest cluster), screened 5,527 tracks
+across 899 netlabel releases via Essentia sidecars, and kept 243 — of which 239
+downloaded (4 lost to transient Archive 5xx) and 238 survived a dest-path
+collision. 3.3 GB, ~66 MB of sidecar traffic to screen it.
+
+What that did to the engine's own report:
+
+| | 25 tracks (2.28h) | 263 tracks (23.78h) |
+|---|---|---|
+| beatmatchable pairs | 36% | **64%** |
+| Camelot coverage | 13/24 | **24/24** |
+| `cut` | 64.5% | **36.0%** |
+| `swap` | 6.3% | **20.1%** |
+| `build` | 13.3% | **25.7%** |
+| `fade` | 10.2% | **14.6%** |
+| `blend` | 5.7% | **3.5%** |
+
+Triage: 253 good, 4 usable, 6 reject.
+
+**This retires "the library is too small and non-diverse" as an explanation for
+monotonous transitions.** Hard cuts nearly halved and three of four crossfade
+styles roughly doubled purely from composition — no engine change. What remains
+is an engine property: `blend` *fell* to 3.5%, and `build`+`fade` together are
+40% of transitions while being separated only by `eo >= ei`, a comparison
+`_match_entry` actively drives toward zero (median margin 0.055 on the old
+library). Variety work now has to come from the mixer, not the music.
+
+Screening rejections, for anyone tuning the filters: 2,361 tracks had no
+Essentia sidecar at all (~43% of the collection — the single biggest loss),
+799 duration, 720 no declared license, 697 wrong subgenre, 678 off-tempo.
+
+Two small known defects, neither fixed here: `Candidate.dest_path` does not
+disambiguate collisions, so two sources mapping to one filename silently lose
+one (1 of 243); and licensing is 46% `-nd`, fine for listening but not for
+publishing a mix built from it — use `--license by,by-sa,by-nc-sa` if that
+matters. `.gitignore` now covers `music/` and `*.db.bak-*`, since the audio
+library and its `PROVENANCE.jsonl` were untracked-but-not-ignored.
+
 ## 2026-08-08 — `gaps` now plans instead of re-deriving (corrects a wrong finding)
 
 `library_gaps` predicted transition styles by calling `choose_transition_style`
