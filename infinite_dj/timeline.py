@@ -82,6 +82,9 @@ def build_timeline(clips: List[dict], tracks: List[TrackMeta],
             "section": c.get("section", ""),
             "bpm": c.get("bpm", 0.0),
             "key": c.get("key", ""),
+            "fade_shape": c.get("fade_shape", ""),
+            "eq": c.get("eq", ""),
+            "layer_gain": c.get("layer_gain", 1.0),
         })
     clips_out.sort(key=lambda c: c["start"])
 

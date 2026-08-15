@@ -118,6 +118,86 @@ function render(t) {
   $("next-title").textContent = clipLabel(st.upcoming);
 }
 
+// ── Overlap timeline ─────────────────────────────────────────────────────────
+// A scrolling multi-lane view of which clips are sounding around `t`, so a
+// layered collage's overlap is visible instead of only audible. Lanes are
+// assigned once per clip (greedy interval colouring, cached by clip identity)
+// so a bar never jumps rows on a later radio poll even though `TL.clips` is
+// replaced wholesale each time.
+const OVERLAP_WINDOW_SEC = 30;
+const OVERLAP_PLAYHEAD_FRAC = 0.28;   // where "now" sits across the window
+const OVERLAP_MAX_LANES = 5;          // matches the engine's highest layer count (insane)
+const OVERLAP_LANE_H = 20;            // px; keep in sync with #lanes height in player.css
+
+const laneOf = new Map();             // clip key -> lane index (or -1: overflow)
+const laneFreeAt = new Array(OVERLAP_MAX_LANES).fill(-Infinity);
+const overlapBars = new Map();        // clip key -> DOM el, reused across frames
+
+function clipKey(c) { return `${c.track}:${c.start}`; }
+
+function assignLanes() {
+  if (!TL) return;
+  const sorted = [...TL.clips].sort((a, b) => a.start - b.start);
+  for (const c of sorted) {
+    const key = clipKey(c);
+    if (laneOf.has(key)) continue;
+    let lane = -1;
+    for (let i = 0; i < OVERLAP_MAX_LANES; i++) {
+      if (laneFreeAt[i] <= c.start) { lane = i; break; }
+    }
+    if (lane !== -1) laneFreeAt[lane] = c.end;
+    laneOf.set(key, lane);
+  }
+}
+
+function renderOverlap(t) {
+  if (!TL) return;
+  assignLanes();
+  const lanesEl = $("lanes");
+  const windowStart = t - OVERLAP_WINDOW_SEC * OVERLAP_PLAYHEAD_FRAC;
+
+  $("playhead").style.left = `${OVERLAP_PLAYHEAD_FRAC * 100}%`;
+
+  const visible = new Set();
+  let activeCount = 0;
+  for (const c of TL.clips) {
+    if (c.start <= t && t < c.end) activeCount++;
+    if (c.end < windowStart || c.start > windowStart + OVERLAP_WINDOW_SEC) continue;
+    const lane = laneOf.get(clipKey(c));
+    if (lane === undefined || lane === -1) continue;   // more than MAX_LANES overlapping — drop, not drawn
+    const key = clipKey(c);
+    visible.add(key);
+    let el = overlapBars.get(key);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "clip-bar";
+      lanesEl.appendChild(el);
+      overlapBars.set(key, el);
+    }
+    const track = TRACKS[c.track] || {};
+    const left = ((c.start - windowStart) / OVERLAP_WINDOW_SEC) * 100;
+    const width = ((c.end - c.start) / OVERLAP_WINDOW_SEC) * 100;
+    el.style.left = `${left}%`;
+    el.style.width = `${Math.max(0.3, width)}%`;
+    el.style.top = `${lane * OVERLAP_LANE_H}px`;
+    el.style.background = track.color || "var(--dim)";
+    const g = clipGain(c, Math.max(c.start, Math.min(c.end - 1e-3, t)));
+    el.style.opacity = `${0.35 + 0.65 * g}`;
+    const span = Math.max(0.01, c.end - c.start);
+    const fadeInPct = c.fade_in > 0 ? Math.min(50, (c.fade_in / span) * 100) : 0;
+    const fadeOutPct = c.fade_out > 0 ? Math.min(50, (c.fade_out / span) * 100) : 0;
+    const mask = `linear-gradient(to right, transparent 0%, black ${fadeInPct}%, ` +
+      `black ${100 - fadeOutPct}%, transparent 100%)`;
+    el.style.maskImage = mask;
+    el.style.webkitMaskImage = mask;
+    el.title = `${readableTrackTitle(track.title)} · ${c.mode}${c.eq ? " · " + c.eq : ""}`;
+  }
+  for (const [key, el] of overlapBars) {
+    if (!visible.has(key)) { el.remove(); overlapBars.delete(key); }
+  }
+  $("layer-count").textContent = `${activeCount} layer${activeCount === 1 ? "" : "s"}`;
+}
+
 // ── Audio graph + stereo power meter (Web Audio API) ─────────────────────────
 // Everything audible runs through one `bus`, so the meters read the same signal
 // whether it comes from the <audio> element (a finished mix) or from scheduled
@@ -231,7 +311,8 @@ function updateMeters() {
   // Same signal that gates the meters — so the badge and the meters can
   // never disagree about whether audio is actually flowing.
   if (RADIO) {
-    $("livetag").textContent = live ? "◉ LIVE" : "❚❚ PAUSED";
+    $("livedot").textContent = live ? "◉" : "❚❚";
+    $("livelabel").textContent = live ? "LIVE" : "PAUSED";
     $("livetag").classList.toggle("paused", !live);
   }
   if (analyserL && analyserR && live) {
@@ -260,6 +341,7 @@ function loop() {
     $("scrub-head").style.left = `${frac * 100}%`;
   }
   render(t);
+  renderOverlap(t);
   updateMeters();
 }
 // Drive updates on a timer rather than requestAnimationFrame: rAF fully pauses

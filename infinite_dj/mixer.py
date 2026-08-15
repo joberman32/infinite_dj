@@ -200,6 +200,84 @@ def _apply_gain(audio: np.ndarray, gain: float) -> np.ndarray:
     return (audio * gain).astype(np.float32)
 
 
+def _layer_gain(n_voices: int) -> float:
+    """
+    Equal-power headroom for a segment joining a stack of `n_voices` total
+    concurrently sounding layers (including itself): 1/sqrt(N). Keeps summed
+    power growing like ln(N) instead of N as `render_collage` stacks layers,
+    without needing to know the future (which/how many layers join later).
+
+    Known limitation, accepted: this is evaluated once, when a segment enters
+    (see `place()`), so it doesn't adapt if layers around it end or new ones
+    join afterward. `_limiter` is the backstop for whatever this
+    approximation misses.
+    """
+    return 1.0 / np.sqrt(max(1, n_voices))
+
+
+def _limiter(audio: np.ndarray, sr: int, ceiling: float = 0.95,
+            lookahead_ms: float = 15.0, release_ms: float = 150.0,
+            pre_tail: Optional[np.ndarray] = None,
+            start_gain: float = 1.0, hop: int = 64) -> tuple:
+    """
+    Short-lookahead peak limiter: instant attack, smoothed release. Unlike a
+    single whole-buffer peak scalar, this responds to the actual hot passage
+    rather than dragging everything else in the buffer/chunk down with it.
+
+    The envelope (forward-looking max of |audio| across channels) is computed
+    at a downsampled control rate (every `hop` samples, ~1.5ms at 44.1kHz) via
+    `scipy.ndimage.maximum_filter1d`, then linearly upsampled back to full
+    rate — cheap even on a full-length render, since the inherently sequential
+    release-smoothing loop only has to run at the control rate.
+
+    `pre_tail` (the last `lookahead_ms` of raw audio from the previous call)
+    and `start_gain` (the previous call's final gain) carry continuity across
+    streaming calls, the same way `render_collage`'s `st["carry"]` does for
+    the audio itself. Returns `(limited_audio, final_gain)`.
+    """
+    from scipy.ndimage import maximum_filter1d
+
+    n = len(audio)
+    if n == 0:
+        return audio, start_gain
+
+    look_n = max(1, int(sr * lookahead_ms / 1000.0))
+    if pre_tail is not None and len(pre_tail):
+        padded = np.concatenate([pre_tail[-look_n:], audio], axis=0)
+        pad_n = min(look_n, len(pre_tail))
+    else:
+        padded = np.concatenate(
+            [np.zeros((look_n, audio.shape[1]), dtype=audio.dtype), audio], axis=0)
+        pad_n = look_n
+
+    # Forward-looking envelope: at sample i we need the max over
+    # [i, i+look_n), i.e. a max filter centred `look_n/2` samples ahead.
+    mag = np.max(np.abs(padded), axis=1)
+    env = maximum_filter1d(mag, size=look_n + 1, origin=-(look_n // 2))
+    env = env[pad_n:pad_n + n]
+
+    # Control-rate gain curve: instant attack (drop immediately to whatever
+    # the lookahead peak demands), one-pole release back toward 1.0.
+    ctrl_idx = np.arange(0, n, hop)
+    ctrl_env = env[ctrl_idx]
+    target = np.minimum(1.0, ceiling / np.maximum(ctrl_env, 1e-9))
+
+    release_per_hop = np.exp(-hop / (sr * (release_ms / 1000.0)))
+    ctrl_gain = np.empty(len(ctrl_idx), dtype=np.float64)
+    g = float(start_gain)
+    for i, tgt in enumerate(target):
+        if tgt < g:
+            g = tgt                                   # instant attack
+        else:
+            g = tgt + (g - tgt) * release_per_hop      # smoothed release
+        ctrl_gain[i] = g
+    final_gain = float(g)
+
+    gain_curve = np.interp(np.arange(n), ctrl_idx, ctrl_gain)
+    limited = (audio * gain_curve[:, None]).astype(np.float32)
+    return limited, final_gain
+
+
 def _split3(audio: np.ndarray, sr: int) -> tuple:
     """
     Split into (low, mid, high) bands by difference-of-lowpass so the three sum
@@ -1522,7 +1600,11 @@ def render_collage(
         seg, eff, was_stretched, fade_sec = got if got else (None, 0.0, False, 0.0)
         end = min(pos + len(seg), len(master)) if seg is not None else pos
         if seg is not None and end > pos:
-            master[pos:end] += seg[:end - pos]
+            # Equal-power headroom for however many layers this segment joins
+            # (itself + whatever `active` hasn't ended yet) — see _layer_gain.
+            n_voices = len(active) + 1
+            g = _layer_gain(n_voices)
+            master[pos:end] += seg[:end - pos] * g
             markers.append(SetMarker(
                 time=pos / sr,
                 label=f"{t.title.split(' - ')[-1][:30]}  [{section.label} @{section.start:.0f}s]",
@@ -1536,6 +1618,7 @@ def render_collage(
                 "mode": mode, "section": section.label,
                 "fade_shape": f"{shape_in}/{shape_out}", "eq": eq_move,
                 "bpm": round(eff, 1), "key": t.key,
+                "layer_gain": round(g, 3),
             })
             active.append((section.embedding, pos + len(seg)))
             recent.append(t.file_path)
@@ -1669,13 +1752,29 @@ def render_collage(
         st["rng"]    = rng
         st["time_offset"] = time_offset + safe / sr
 
-        # Ceiling that only ever drops, so committed blocks join without the
-        # level pumping a per-block normalise would cause.
-        gain = st.get("gain", 1.0)
+        # A local lookahead limiter does the real peak control now (it reacts
+        # to the actual hot passage, not the whole committed block), so this
+        # scalar only has to trim whatever it didn't already catch. Because
+        # that residual should now be small, the ceiling can recover after a
+        # dense passage instead of staying pinned for the rest of the radio
+        # session — the instant-duck/slow-release shape a limiter itself
+        # uses, one level up. (Previously this only ever dropped, to avoid
+        # the pumping a per-block *normalize* would cause; that risk doesn't
+        # apply to a slow exponential recovery riding on top of the limiter.)
         if len(out):
+            raw_tail = out[-int(sr * 0.015):].copy()   # pre-limiter, for next call's lookahead
+            out, limiter_gain = _limiter(
+                out, sr, pre_tail=st.get("limiter_tail"),
+                start_gain=st.get("limiter_gain", 1.0))
+            st["limiter_tail"] = raw_tail
+            st["limiter_gain"] = limiter_gain
+
+            gain = st.get("gain", 1.0)
             peak = float(np.abs(out).max()) * gain
             if peak > 0.95:
                 gain = 0.95 / max(1e-9, float(np.abs(out).max()))
+            else:
+                gain = min(1.0, gain + 0.02)   # slow recovery, ~minutes to unwind a duck
             st["gain"] = gain
             out = np.clip(out * gain, -0.99, 0.99).astype(np.float32)
         return out, sr, markers, clips
@@ -1686,6 +1785,11 @@ def render_collage(
     fade_s = min(int(2.0 * sr), len(output))
     if fade_s > 0:
         output[-fade_s:] *= np.linspace(1.0, 0.0, fade_s, dtype=np.float32).reshape(-1, 1)
+    if len(output):
+        output, _ = _limiter(output, sr)
+    # Cheap final defensive clamp — should rarely fire once the limiter above
+    # is doing the real work; kept as insurance against float rounding and
+    # lookahead edge effects at the very start/end of the render.
     peak = np.abs(output).max()
     if peak > 0.95:
         output = output * (0.95 / peak)

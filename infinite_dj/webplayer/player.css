@@ -57,6 +57,20 @@ body {
 }
 #incoming-title { opacity: 0; pointer-events: none; }
 
+/* Overlap timeline — the one place per-track colour is used; the rest of the
+   player is deliberately monochrome, but telling 2-5 simultaneous lanes apart
+   needs a differentiator and colour is the clearest one at this scale. */
+#overlap-head { color: var(--dim); font-size: 11px; letter-spacing: .14em;
+  text-transform: uppercase; display: flex; justify-content: space-between; }
+#layer-count { color: var(--fg); font-variant-numeric: tabular-nums; }
+#lanes { position: relative; height: 104px; margin-top: 8px; border: 1px solid var(--line);
+  background: var(--bg); overflow: hidden; }
+#playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--fg);
+  opacity: .5; z-index: 2; }
+.clip-bar { position: absolute; height: 16px; border-radius: 2px;
+  transition: left 33ms linear, width 33ms linear, opacity 120ms linear;
+  will-change: left, opacity; }
+
 /* Stereo power meter */
 #meter { display: flex; gap: 28px; justify-content: center; padding: 4px 0; }
 .meter-chan { display: flex; flex-direction: column; align-items: center; gap: 8px; }
@@ -101,6 +115,10 @@ body {
 #livetag, #exitbtn { display: none; }
 .livetag { color: var(--fg); font-size: 11px; letter-spacing: .16em; flex: 1; }
 .livetag.paused { color: var(--dim); }
+.livedot { display: inline-block; animation: livepulse 1.6s ease-in-out infinite; }
+.livetag.paused .livedot { animation: none; }
+@keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .livedot { animation: none; } }
 #exitbtn { background: var(--bg); color: var(--dim); border: 1px solid var(--line2);
   cursor: pointer; font: inherit; font-size: 11px; letter-spacing: .12em; padding: 10px 14px; }
 #exitbtn:hover { color: var(--fg); border-color: var(--fg); }

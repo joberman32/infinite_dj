@@ -4,6 +4,79 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-14 — Collage overlap: equal-power layer gain, a real limiter, and an overlap timeline in the player
+
+Listening at high Serendipity (`render_collage`, 3-5 simultaneous layers)
+surfaced clipping-sounding audio when many layers overlapped, and the player
+had no way to see overlap even though it's the interesting part. Both traced
+to the same root cause: `place()`'s `active` list (how many layers are
+currently sounding) was private bookkeeping for beat-lock/EQ decisions —
+never used to control gain, never exported.
+
+**Clipping.** Overlapping layers were summed with a plain `master[pos:end] +=
+seg`, no per-overlap gain compensation (contrast `render_set`'s crossfade
+path, which pads with `_apply_gain(mix, 0.9)`). The only safety net was a
+single **global peak scalar** applied once after an entire buffer/chunk was
+already summed — dense passages rode right up to that ceiling with no
+true-peak margin, and in the streaming/radio path the ceiling only ever
+dropped, so one dense passage permanently quietened the rest of a session.
+Historical "peak ≤ 0.95, no clipping" CHANGELOG notes were always a single
+global check, never re-verified after `chaos`/5-layer `insane` shipped, and
+there was zero test coverage of gain-summing across layers.
+
+Fix, three parts:
+
+- **`_layer_gain(n)` = 1/√n`, applied in `place()`** at the moment a segment
+  is summed in, using `len(active) + 1` (already computed there for the
+  beat-lock decision). Equal-power headroom: summed power grows like ln(N)
+  instead of N as layers stack. Fixed at the concurrency measured when a
+  segment *enters* — it doesn't adapt if layers around it end or join later;
+  accepted as an approximation, with the limiter below as backstop. Each
+  clip's `layer_gain` is recorded (feeds the new player UI, see below).
+- **`_limiter`**: a short-lookahead (15ms), smoothed-release (150ms) peak
+  limiter, replacing the single whole-buffer scalar as the actual peak
+  control. Envelope computed at a downsampled control rate via
+  `scipy.ndimage.maximum_filter1d`, cheap even on a full-length render.
+  Confirmed safe to add real DSP cost here: `RadioSession._run` renders on a
+  background thread, not the real-time `sounddevice` callback in `engine.py`.
+- **Streaming residual ceiling can now recover.** With the limiter doing the
+  real peak control, the old whole-block `gain` scalar's job shrinks to
+  trimming whatever's left — so it now ducks instantly (unchanged) but
+  recovers slowly (`gain = min(1.0, gain + 0.02)` per 20s block, full
+  recovery in minutes) instead of staying pinned for the rest of the radio
+  session. This overrides the scalar's previous documented rationale
+  ("ceiling that only ever drops, so committed blocks join without the
+  pumping a per-block normalize would cause") — deliberately: that risk
+  applied to a per-block *normalize*, not to a slow exponential recovery
+  riding on top of a limiter that's already doing the transient-level work.
+
+New tests in `tests/test_collage_gain.py`: `_layer_gain`'s formula, `_limiter`
+respecting its ceiling and recovering (including across streaming calls),
+`render_collage` at `layers=5, chaos=1.0` staying under the ceiling with every
+clip's `layer_gain` matching the concurrency reconstructed from the clip list
+itself, and a regression test that a dense block's ducked streaming ceiling
+recovers over subsequent calm blocks rather than staying pinned.
+
+**Overlap visualization.** `build_timeline` already exported per-clip
+`start`/`end`/`fade_in`/`fade_out`, and the player's `playerState(t)` already
+computed which clips were sounding at a given time — but the UI only ever
+rendered a two-line PREV/NOW/NEXT title fade. `timeline.py` now also passes
+through `fade_shape`/`eq`/`layer_gain` (already computed by `render_collage`,
+previously dropped). The player gained an `#overlap` panel: a scrolling
+~30s multi-lane timeline (DOM+CSS, matching the existing meter-bar idiom —
+no canvas, no framework, no build step) where each visible clip is a
+colour-coded bar (reusing `timeline.py`'s existing per-track HSL colour,
+`_color_for`, previously computed but unused by the frontend), fade-tapered
+via a CSS mask from `fade_in`/`fade_out`, brightened/dimmed live by the same
+`clipGain` math the title-fade already used, plus an "N layers" count. Colour
+is scoped to this one panel — the rest of the player stays the deliberately
+monochrome design from the earlier `1f5bdd1` redesign. Lanes are assigned
+once per clip (greedy interval colouring, cached by clip identity) so a bar
+never jumps rows across a radio poll even though `TL.clips` is replaced
+wholesale each time; wired into the existing `loop()` timer, not a new one
+(the player deliberately avoids `requestAnimationFrame`, which pauses on
+hidden tabs).
+
 ## 2026-08-14 — Gap detection for the real-time engine
 
 Added checks in `engine.py` so a live `play` session surfaces "one track

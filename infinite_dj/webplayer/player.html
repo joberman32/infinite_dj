@@ -38,6 +38,15 @@
         </div>
       </section>
 
+      <!-- Overlap timeline: which clips are sounding right now, and how many -->
+      <section id="overlap">
+        <div id="overlap-head">
+          <span class="slot-label">OVERLAP</span>
+          <span id="layer-count"></span>
+        </div>
+        <div id="lanes"><div id="playhead"></div></div>
+      </section>
+
       <!-- Live stereo power meter -->
       <section id="meter">
         <div class="meter-chan">
@@ -55,7 +64,7 @@
     <footer id="transport">
       <button id="playbtn" aria-label="Play/Pause">▶</button>
       <div id="scrub" class="scrub"><div id="scrub-fill"></div><div id="scrub-head"></div></div>
-      <div id="livetag" class="livetag">◉ LIVE</div>
+      <div id="livetag" class="livetag"><span id="livedot" class="livedot">◉</span> <span id="livelabel">LIVE</span></div>
       <div id="ttime" class="ttime">0:00</div>
       <button id="exitbtn" aria-label="Exit radio">EXIT</button>
     </footer>
