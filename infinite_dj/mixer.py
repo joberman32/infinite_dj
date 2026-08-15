@@ -16,6 +16,7 @@ Pipeline:
 """
 
 import os
+import hashlib
 import numpy as np
 import soundfile as sf
 import librosa
@@ -524,8 +525,35 @@ def _default_profile(style: TransitionStyle) -> TransitionProfile:
                          in_high_lead=style.in_high_delay)
 
 
+
+# `fade` vs `build` is decided below by the sign of `eo - ei`. Mining real DJ
+# mixes (CHANGELOG, 2026-08-08) found that comparison carries almost no signal:
+# median margin 0.055 across the 141/213 beatmatched pairs that reach it, 46%
+# inside 0.05, 12% inside 0.01 — `_match_entry` picks the incoming cue by
+# *minimizing* |eo - ei|, so it equalizes the two energies and then the style
+# branches on the sign of the difference it just drove toward zero. Below this
+# margin the sign is measurement noise, not a musical decision, so it is not
+# trustworthy as one; TIE_MARGIN gates a deliberate, reproducible draw instead
+# (see `_seeded_unit`) rather than letting floating-point noise decide.
+TIE_MARGIN = 0.08
+
+
+def _seeded_unit(*parts) -> float:
+    """
+    Deterministic pseudo-random float in [0, 1) from stable parts. Same inputs
+    always give the same output (needed so `plan_transition` stays a pure,
+    replayable function for the corpus validator and for `gaps`/`triage`), but
+    the output is decorrelated from tiny numeric noise in the inputs the way a
+    direct sign comparison isn't. Not `hash()` — that's salted per-process.
+    """
+    key = "|".join(repr(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
 def choose_transition_style(out_cue, in_cue, beatmatched: bool,
-                            high_sim_threshold: float = 0.82) -> TransitionStyle:
+                            high_sim_threshold: float = 0.82,
+                            seed_extra: tuple = ()) -> TransitionStyle:
     """
     Pick a crossfade style from the energy and CLAP vector similarity of the
     outgoing exit and incoming entry. Beat-locked pairs get real blends shaped
@@ -535,6 +563,11 @@ def choose_transition_style(out_cue, in_cue, beatmatched: bool,
     blend is forced; callers pass a per-library calibrated value (the fixed
     0.82 default is only a fallback — on a real library it fires on ~30% of
     pairs and doesn't discriminate).
+
+    `seed_extra` lets a caller (e.g. `plan_transition`, which knows the two
+    tracks and how many times this pair has already transitioned in the current
+    set) salt the `fade`/`build` tie-break so a repeated pair doesn't land on
+    the same coin every time. Omit it and the draw is keyed on the cues alone.
     """
     if not beatmatched:
         # Tempos clash — a long overlap would phase two grooves through each
@@ -577,7 +610,21 @@ def choose_transition_style(out_cue, in_cue, beatmatched: bool,
         return styled("swap", bars("swap_bars"),
                       cp=0.50, mid_lead=0.50, high_lead=0.10,
                       out_mid_hold=0.50, out_high_hold=0.30)
-    if eo >= ei:
+    margin = eo - ei
+    if abs(margin) < TIE_MARGIN:
+        # Too close to call from energy alone. Weight a deterministic draw by
+        # the (weak) signal we do have — an exact tie is a 50/50 coin, and the
+        # draw tilts toward whichever side the margin already leans as it
+        # approaches TIE_MARGIN, where the sign comparison below takes over.
+        p_fade = 0.5 + (margin / TIE_MARGIN) * 0.5
+        draw = _seeded_unit(
+            getattr(out_cue, "timestamp", -1.0), getattr(in_cue, "timestamp", -1.0),
+            round(eo, 4), round(ei, 4), *seed_extra,
+        )
+        is_fade = draw < p_fade
+    else:
+        is_fade = margin >= 0
+    if is_fade:
         # Busier → calmer: gentle medium fade, incoming eased in.
         return styled("fade", bars("fade_bars"),
                       cp=0.55, mid_lead=0.30, high_lead=0.20)
@@ -992,6 +1039,7 @@ def plan_transition(
     max_stretch: float = MAX_STRETCH,
     sim_threshold: float = 0.82,
     splice: Optional[tuple] = None,
+    occurrence: int = 0,
 ) -> TransitionPlanned:
     """
     Choose the exit cue, entry cue and crossfade style for one A→B transition.
@@ -1005,6 +1053,11 @@ def plan_transition(
     `duration`, so it has to be passed in rather than read off the TrackMeta).
     `splice` is `(min_seg_sec, max_seg_sec)` for collage mode, else None.
     `min_solo_bars` defaults to the calibrated value (32 without a corpus).
+    `occurrence` is how many times this ordered (track_out, track_in) pair has
+    already transitioned earlier in the same set/session (radio mode can repeat
+    pairs over a long run) — it salts the `fade`/`build` tie-break in
+    `choose_transition_style` so a repeated pair doesn't draw the same coin
+    every time. Callers that don't track repeats can leave it at 0.
 
     Sample-domain clamping stays in the caller: it depends on the rendered buffer
     length and, for the tail clamp, on the style this function returns.
@@ -1060,8 +1113,10 @@ def plan_transition(
     )
 
     # ── Pick a crossfade style from the two tracks' dynamics ──────────────────
-    style = choose_transition_style(out_cue, in_cue, beatmatched,
-                                    high_sim_threshold=sim_threshold)
+    style = choose_transition_style(
+        out_cue, in_cue, beatmatched, high_sim_threshold=sim_threshold,
+        seed_extra=(track_out.file_path, track_in.file_path, occurrence),
+    )
 
     return TransitionPlanned(cue_out=out_cue, cue_out_t=cue_out_t,
                              cue_in=in_cue, cue_in_t=cue_in_t,
@@ -1129,6 +1184,7 @@ def render_set(
     written = 0
     cur_start = 0             # output sample where the current track became audible
     prev_fade_in = 0.0        # fade-in of the current track (from the previous xfade)
+    pair_occurrence: dict = {}  # (out path, in path) -> times already transitioned
 
     for i in range(len(tracks) - 1):
         solo_start = written  # output sample where this track's solo begins
@@ -1140,11 +1196,15 @@ def render_set(
         read_t    = read / sr
 
         # ── Cue + style selection (shared with the corpus validator) ───────────
+        pair_key = (cur_t.file_path, nxt_t.file_path)
+        occurrence = pair_occurrence.get(pair_key, 0)
+        pair_occurrence[pair_key] = occurrence + 1
         planned = plan_transition(
             cur_t, nxt_t, read_t, cur_dur,
             min_solo_bars=min_solo_bars, max_stretch=max_stretch,
             sim_threshold=sim_threshold,
             splice=((min_seg_sec, max_seg_sec) if splice else None),
+            occurrence=occurrence,
         )
         ratio, beatmatched = planned.ratio, planned.beatmatched
         out_cue, cue_out_t = planned.cue_out, planned.cue_out_t

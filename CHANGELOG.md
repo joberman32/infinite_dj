@@ -4,6 +4,53 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-14 — `fade`/`build` tie-break: deliberate draw instead of noise sign
+
+Follow-up to 2026-08-08's finding: `choose_transition_style` picked `fade` vs
+`build` by the raw sign of `eo - ei` (exit energy vs. entry energy), but
+`_match_entry` chooses the entry cue by *minimizing* that same difference —
+so the branch was equalizing two energies and then reading the sign of the
+noise left over. Measured on the mined corpus: median margin 0.055, 46% of
+beatmatched pairs inside 0.05, 12% inside 0.01. That's not a musical decision,
+it's measurement noise wearing a decision's clothes — and with the library at
+263 tracks, `build`+`fade` are ~40% of all transitions, so it decides the
+majority of what a full set actually sounds like at this boundary.
+
+Fix: a `TIE_MARGIN = 0.08` band around the tie. Outside it, the sign still
+decides, unchanged (`test_decisive_margins_are_unaffected`). Inside it,
+`choose_transition_style` draws from `_seeded_unit` — a SHA-256-based
+deterministic float in [0, 1), not `hash()` (salted per-process, so not
+reproducible run-to-run) — weighted linearly by the margin so an exact tie is
+50/50 and the draw converges to the sign comparison as it nears `TIE_MARGIN`.
+
+This was framed in the 2026-08-08 entry as "an argument for the seeded-variance
+design rather than against it: replacing a coin flip on noise with a
+deliberate, reproducible choice is a strict improvement" — the design here is
+that deliberate choice. Two things it guarantees that the old code didn't:
+
+- **Reproducibility.** Same cues in, same style out, every run — `plan_transition`
+  stays a pure, replayable function (required by `gaps`/`triage`/the corpus
+  validator), which a literal RNG draw would have broken.
+- **No systematic bias.** A true tie is close to 50/50 over many draws
+  (`test_exact_tie_is_roughly_balanced_over_many_draws`), rather than
+  whatever bias floating-point ordering of `eo`/`ei` happened to introduce.
+
+`choose_transition_style` gained an optional `seed_extra` tuple so a caller can
+salt the draw; `plan_transition` gained `occurrence` (times this ordered
+track pair has already transitioned in the current render) and passes
+`(track_out.file_path, track_in.file_path, occurrence)` as that salt.
+`render_set` tracks per-pair occurrence counts and threads them through — so a
+repeated pair (radio mode, over a long run) isn't guaranteed to draw the same
+coin twice. Callers that don't track repeats (`library_health.plan_transition`
+calls, one-off `gaps` measurement) default `occurrence=0` and still get a
+reproducible, pair-specific draw from the cues alone.
+
+Not touched: the `blend`/`swap` thresholds (0.45/0.70) and the `sim >=
+high_sim_threshold` blend gate. Both are hard cutoffs on values calibration.py
+already documents as not mineable from mix audio (different energy
+normalization between mined-mix and per-track measurement); a margin-based
+tie-break there would need its own justification, not an extension of this one.
+
 ## 2026-08-09 — the library is no longer the bottleneck (first bulk `fetch`)
 
 Ran the `gaps → fetch → analyze → triage → gaps` loop for real. `fetch
