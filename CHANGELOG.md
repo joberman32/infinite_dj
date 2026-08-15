@@ -4,6 +4,124 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-15 — Shelving EQ: the bass swap now actually swaps the bass
+
+**The bass swap did not work.** `_split3` splits into three bands and re-sums
+them with independent gains. The bands are causal IIR outputs with *different
+phase*, so they reconstruct only when their gains are equal — and a DJ EQ
+exists to make them unequal. Set the low lane to 0 and the bass does not
+leave; it reappears phase-shifted inside the mid band.
+
+Measured on `_blend`, isolating the outgoing path (real track, 16-bar blend,
+sub-200 Hz RMS relative to the automation curve the lane asks for):
+
+| phase | low lane says | band-split | shelf |
+|---|---|---|---|
+| 0.50 | 0.50 | 0.65 | 0.51 |
+| 0.60 | 0.08 | **0.57** | 0.10 |
+| 0.70 | 0.00 | **0.45** | 0.02 |
+| 0.80 | 0.00 | **0.30** | 0.01 |
+
+Worst deviation from the intended curve: **0.48 band-split, 0.02 shelf.** At
+phase 0.6 the outgoing kick is seven times louder than asked for. Sweeping a
+tone through the "low band killed" state *boosts* 80–200 Hz by up to +5 dB
+rather than removing it. So "single source at a time — only one kick drum ever
+plays", the claim the mixing design rests on, was not happening: on a 16-bar
+blend both kicks ran together for roughly the second half of every crossfade.
+
+This was already half-known. `_split3_zerophase` (added for the collage)
+documents the same effect and works around it with `sosfiltfilt` — but
+zero-phase filtering needs the whole segment in hand, so the crossfade path,
+which must stream, kept the causal version and kept the bug.
+
+**The fix is a different topology, not a better band-split.** A real DJ
+mixer's EQ is not a band-split; it is a cascade of minimum-phase shelving and
+peaking filters applied to the signal, where the magnitude response *is* the
+intended curve. Nothing is re-summed, so there is nothing to mis-cancel.
+(Topology from Vande Veire & De Bie; their repo is AGPL, so this is a fresh
+implementation from the published RBJ Audio EQ Cookbook formulas.)
+
+Design points worth keeping:
+
+- **`_split_overall` factors level out of shape.** The lanes carry both "how
+  loud" and "how shaped". A shelf floors at `EQ_FLOOR_DB` and can never reach
+  silence, yet the incoming track's lanes are all 0.0 at phase 0 and must
+  contribute *nothing*. Pulling `overall = max(lanes)` out as a scalar gain
+  restores both exactness properties the band-split had for free: equal lanes
+  give a flat cascade times the level (no colouring), and all-zero lanes give
+  true digital silence.
+- **`SHELF_STAGES = 2`.** Cascading N shelves at dB/N is steeper than one
+  shelf at the full dB. At matched bass kill (60 Hz → 0.065): one −24 dB shelf
+  leaves 400 Hz at 0.710, two −12 dB shelves leave it at 0.813.
+- **`EQ_FLOOR_DB = −30`**, not −∞ or −40. A killed band lands ~30 dB under the
+  incoming track — comfortably masked — for ~2.5 dB of collateral at 400 Hz.
+  −40 dB buys inaudible extra kill for real low-mid loss (400 Hz → 0.619).
+- **`SHELF_MID_Q = 0.50`**, chosen for evenness rather than isolation. The mid
+  lane is the *primary midrange crossfade*, not a surgical cut, so an uneven
+  bell turns a level change into a notch at 720 Hz. Lower Q is flatter across
+  the band's 3.7 octaves but reaches further into its neighbours; that
+  collateral only bites when the mid is killed with both neighbours wide open,
+  which current profiles never reach (mid lead ≤ 0.50 while the bass swap
+  completes at ≥ 0.62). 0.50 favours the case that always happens without
+  going all the way to the 0.30 the bandwidth would theoretically imply.
+- **Coefficients ride a global control grid**, recomputed every
+  `EQ_CTRL_HOP` (512) samples and *carried in state across chunks*. The first
+  implementation sampled the lane at each chunk's start, which made the render
+  depend on where the producer happened to cut its chunks; a chunk beginning
+  mid-segment must keep the coefficients derived at that segment's true global
+  start, exactly like `zi`. Pinned by
+  `test_uneven_chunk_boundaries_do_not_shift_the_shelf_control_grid`, which
+  caught it.
+
+`EQ_TOPOLOGY` selects `"shelf"` (default) or the legacy `"split"`. An
+explicitly supplied filter state always wins, so a transition already under
+way keeps its topology mid-flight rather than switching EQ under itself.
+Streaming callers build state via `make_crossfade_state()` instead of naming a
+class, so the flag moves live playback and offline rendering together.
+
+Cost: 179x realtime vs 290x for the band-split on a 30 s crossfade in 4096-
+frame chunks. The producer thread needs >1x.
+
+Note for anyone extending this: `slope`/`q` are read from the module globals at
+call time, not bound as default arguments. An earlier version used
+`slope: float = SHELF_SLOPE`, which binds at import and silently ignored
+`SHELF_SLOPE` changes — a parameter sweep showed slope having exactly zero
+effect, which was a measurement artifact, not a result.
+
+### Unexpected consequence: it moved a documented negative result
+
+Two `test_transition_probe.py` tests failed on this change — the ones pinning
+CALIBRATION.md §4, "per-band automation is **not recoverable**". They failed
+because they got *better*, and that is worth understanding before trusting it.
+
+`build_mix` renders its fixtures through the mixer's real `_blend`, so the
+renderer under the measurement is a variable of the experiment, not a
+constant. Same estimator, same sweep, only the renderer swapped:
+
+| renderer | true range | measured | compression |
+|---|---|---|---|
+| band-split | 11.46 s | 4.21 s | 2.72x |
+| shelving | 11.46 s | 11.18 s | **1.02x** |
+
+The 4.21 s reproduces CALIBRATION.md's documented 4.2 s, so this is the same
+measurement that produced the finding. The estimator was never the limit here:
+the renderer had smeared the bass swap it was being asked to locate. The mid-
+span bias moved for the same reason (2.25x → 1.27x) — `_split3`'s mid band is
+`lp(2600) - lp(200)` on causal filters and therefore carries phase-shifted
+residue of *both* neighbours.
+
+Handled by naming the renderer in each test rather than relaxing either
+assertion: the split-renderer results are preserved verbatim (they remain true
+of that renderer) and the shelf results are pinned separately. **`cp` is
+re-opened as a question, not recovered** — the fixture uses an idealised shelf,
+while real mixers have unknown corners and real DJs ride faders in ways
+`_make_profile` doesn't model. Deciding it needs a sweep against mined mixes,
+which has not been run.
+
+Tests: `tests/test_shelf_eq.py`; chunked-vs-continuous is now asserted for
+both topologies in `tests/test_engine_scheduling.py`; the probe tests gained a
+`topology` fixture and split into per-renderer cases.
+
 ## 2026-08-14 — Collage overlap: equal-power layer gain, a real limiter, and an overlap timeline in the player
 
 Listening at high Serendipity (`render_collage`, 3-5 simultaneous layers)

@@ -19,12 +19,28 @@ Two things this harness is deliberately careful about:
 import numpy as np
 import pytest
 
+import infinite_dj.mixer as mixer
 from infinite_dj.mixer import (
     TransitionStyle,
     _blend,
     _make_profile,
     choose_transition_style,
 )
+
+
+@pytest.fixture
+def topology(monkeypatch):
+    """Render the fixture through a chosen EQ topology.
+
+    `build_mix` blends with the mixer's real `_blend`, so the renderer under
+    the fixture is a variable of the experiment, not a constant. Tests that
+    pin a measurement result have to say which renderer produced it — see
+    CHANGELOG 2026-08-15, where switching topology moved a documented
+    negative result.
+    """
+    def _set(name):
+        monkeypatch.setattr(mixer, "EQ_TOPOLOGY", name)
+    return _set
 from infinite_dj.transition_probe import (
     BANDS,
     band_slice,
@@ -259,33 +275,60 @@ def test_recovers_a_short_swap_relative_to_a_blend():
     assert r.duration_bars < 0.75 * rb.duration_bars
 
 
-def test_asymmetric_lanes_overestimate_the_mid_span():
-    """
-    A known, characterised bias — pinned so it can't drift unnoticed.
-
-    `swap` holds the incoming mids back (`in_mid_lead=0.50`) while bringing its
-    highs in early (`in_high_lead=0.10`). Those early highs leak into the mid
-    analysis slice through STFT spread of impulsive hats, so the mid band reads
-    ~2x its true span. Rebuilding the identical mix with the highs held back
-    too removes the effect entirely, which is what identifies the cause.
-
-    This is why the validator must render-and-probe the engine's side rather
-    than reading its automation lanes analytically: the bias only cancels if
-    both sides pass through the same spectral analysis.
-    """
+def _mid_span_overestimate():
+    """(highs-brought-in-early, highs-held-back) mid-span overestimate ratios."""
     mono, truth = build_mix(SWAP_8)
     r = run_probe(mono, truth)
     assert r.status == "ok", r.reject_reason
-    over = r.bands["mid"].span_1090 / truth["span"]["mid"]
-    assert 1.6 < over < 2.8, over
+    early = r.bands["mid"].span_1090 / truth["span"]["mid"]
 
     # Same profile, but with the incoming highs held back to match the mids.
     held = blend_style("swap_held", 8, 0.50, 0.50, 0.50, 0.50, 0.30)
     mono2, truth2 = build_mix(held)
     r2 = run_probe(mono2, truth2)
     assert r2.status == "ok", r2.reject_reason
-    over2 = r2.bands["mid"].span_1090 / truth2["span"]["mid"]
-    assert over2 < 1.3, (over, over2)
+    return early, r2.bands["mid"].span_1090 / truth2["span"]["mid"]
+
+
+def test_asymmetric_lanes_overestimate_the_mid_span_under_the_split_renderer(topology):
+    """
+    A known, characterised bias — pinned so it can't drift unnoticed.
+
+    `swap` holds the incoming mids back (`in_mid_lead=0.50`) while bringing its
+    highs in early (`in_high_lead=0.10`). Under the band-split renderer the mid
+    band reads ~2x its true span. Rebuilding the identical mix with the highs
+    held back too removes the effect, which is what identifies the cause.
+
+    This is why the validator must render-and-probe the engine's side rather
+    than reading its automation lanes analytically: the bias only cancels if
+    both sides pass through the same spectral analysis.
+    """
+    topology("split")
+    early, held = _mid_span_overestimate()
+
+    assert 1.6 < early < 2.8, early
+    assert held < 1.3, (early, held)
+
+
+def test_shelf_renderer_largely_removes_the_mid_span_bias(topology):
+    """
+    The same bias, measured through the shelving renderer: ~2.25x -> ~1.27x.
+
+    Same root cause as the bass leak. `_split3`'s "mid" band is
+    `lp(2600) - lp(200)` on causal filters, so it carries phase-shifted
+    residue of *both* neighbours; a shelving cascade separates bands by
+    magnitude response instead, so much less of the early highs lands in the
+    mid analysis slice.
+
+    The diagnostic contrast largely collapses with it (1.27x vs 1.21x), so
+    under this renderer the held-back comparison no longer isolates the cause —
+    which is why the split case above is kept rather than replaced.
+    """
+    topology("shelf")
+    early, held = _mid_span_overestimate()
+
+    assert early < 1.6, early
+    assert held < 1.3, (early, held)
 
 
 def test_duration_is_linear_in_crossfade_length():
@@ -351,22 +394,8 @@ def test_band_centres_land_within_a_bar():
                                                           expected)
 
 
-def test_band_phase_does_not_track_cp():
-    """
-    A pinned negative result: `band_phase` is diagnostic output, not a
-    calibration target.
-
-    Sweeping the bass-swap centre across most of its usable range moves the true
-    low-band centre by ~11.5 s but the measured one by ~4.2 s. The relationship
-    is monotone, so it looks encouraging in isolation — but a 2.7x compression
-    leaves too little dynamic range to survive real-world noise, and the
-    inter-band separations that would calibrate `_make_profile` are the same size
-    as the measurement error.
-
-    (Compression was ~8x before the local refit was added; improving the
-    estimator improved this, and if someone tightens it below ~1.5x the
-    calibration scope should widen to include the profile parameters.)
-    """
+def _cp_sweep_compression():
+    """Sweep the bass-swap centre; return (true_range, measured_range)."""
     measured, true_centres = [], []
     for cp in (0.35, 0.50, 0.65, 0.72):
         style = blend_style("blend", 16, cp, 0.12, 0.12)
@@ -376,12 +405,54 @@ def test_band_phase_does_not_track_cp():
         assert r.bands["low"].ok, cp
         measured.append(r.bands["low"].center_t)
         true_centres.append(truth["t_start"] + cp * truth["xfade_sec"])
+    return (max(true_centres) - min(true_centres),
+            max(measured) - min(measured))
 
-    true_range = max(true_centres) - min(true_centres)
-    meas_range = max(measured) - min(measured)
+
+def test_band_phase_does_not_track_cp_under_the_split_renderer(topology):
+    """
+    The pinned negative result, preserved with its renderer named.
+
+    Sweeping the bass-swap centre across most of its usable range moves the
+    true low-band centre by ~11.5 s but the measured one by ~4.2 s. A 2.7x
+    compression leaves too little dynamic range to survive real-world noise,
+    and the inter-band separations that would calibrate `_make_profile` are
+    the same size as the measurement error.
+
+    This remains true of the band-split renderer. It is *not* a standalone
+    fact about the estimator — see the shelf case below.
+    """
+    topology("split")
+    true_range, meas_range = _cp_sweep_compression()
+
     assert true_range > 10.0, true_range
-    # Still compressed by more than 2x — the finding this test exists to pin.
     assert meas_range < true_range / 2.0, (meas_range, true_range)
+
+
+def test_shelf_renderer_makes_cp_recoverable_on_synthetic_mixes(topology):
+    """
+    The same sweep, same estimator, through the shelving renderer: compression
+    collapses from 2.7x to ~1.0x.
+
+    Nothing about the measurement DSP changed. The band-split simply did not
+    put the bass swap where its own automation said — it deviated from the low
+    lane by up to 0.48 (CHANGELOG 2026-08-15) — so there was little to find.
+    The docstring above set <1.5x as the threshold at which "the calibration
+    scope should widen to include the profile parameters"; on synthetic mixes
+    that threshold is now met.
+
+    ⚠ This does NOT re-open `cp` as a calibration target on real mixes. The
+    fixture renders with an *idealised* shelf EQ; real mixers have unknown
+    corners and slopes, and a real DJ rides faders in ways `_make_profile`
+    does not model. This is an upper bound under ideal conditions, and the
+    other findings in CALIBRATION.md (notably the ~25-beat blend-duration
+    error) are untouched. Validating it needs mined mixes, not this fixture.
+    """
+    topology("shelf")
+    true_range, meas_range = _cp_sweep_compression()
+
+    assert true_range > 10.0, true_range
+    assert meas_range > true_range / 1.5, (meas_range, true_range)
 
 
 @pytest.mark.parametrize("offset", [-30.0, -10.0, 0.0, 10.0, 25.0])

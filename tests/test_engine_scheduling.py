@@ -18,7 +18,12 @@ from infinite_dj.engine import (
     _crossfade_progress,
     _transition_start_time,
 )
-from infinite_dj.mixer import CrossfadeFilterState, TransitionStyle, _blend
+from infinite_dj.mixer import (
+    CrossfadeFilterState,
+    ShelfCrossfadeState,
+    TransitionStyle,
+    _blend,
+)
 from infinite_dj.models import CuePoint, TrackMeta
 
 
@@ -128,15 +133,22 @@ class RealtimeCrossfadeTests(unittest.TestCase):
 
         self.assertIn("[MIXING 75%]", output.getvalue())
 
-    def test_stateful_chunked_blend_matches_continuous_rendering(self):
+    def _assert_chunked_matches_continuous(self, make_state):
+        """Streaming in chunks must equal one continuous render, per topology.
+
+        The engine renders a crossfade in ~93ms producer chunks while the
+        offline renderer does it in one call; they have to agree sample-for-
+        sample or a live mix and its rendered twin drift apart.
+        """
         n = 512
         outgoing = np.ones((n * 2, 2), dtype=np.float32)
         incoming = np.zeros((n * 2, 2), dtype=np.float32)
         phase = np.linspace(0.0, 1.0, n * 2, dtype=np.float32)
         style = TransitionStyle("test", 8)
 
-        continuous = _blend(outgoing, incoming, phase, style=style)
-        state = CrossfadeFilterState.create()
+        continuous = _blend(outgoing, incoming, phase, style=style,
+                            filter_state=make_state())
+        state = make_state()
         chunked = np.concatenate((
             _blend(outgoing[:n], incoming[:n], phase[:n], style=style,
                    filter_state=state),
@@ -145,6 +157,40 @@ class RealtimeCrossfadeTests(unittest.TestCase):
         ))
 
         np.testing.assert_allclose(chunked, continuous, rtol=1e-5, atol=1e-5)
+
+    def test_stateful_chunked_blend_matches_continuous_rendering(self):
+        self._assert_chunked_matches_continuous(CrossfadeFilterState.create)
+
+    def test_shelf_chunked_blend_matches_continuous_rendering(self):
+        self._assert_chunked_matches_continuous(ShelfCrossfadeState.create)
+
+    def test_uneven_chunk_boundaries_do_not_shift_the_shelf_control_grid(self):
+        """Coefficient updates ride a global grid, not the chunk boundary.
+
+        The producer's chunk sizes vary (a transition can start mid-chunk), so
+        if the control grid were chunk-relative the same crossfade would render
+        differently depending on where chunks happened to fall.
+        """
+        total = 4096
+        outgoing = np.ones((total, 2), dtype=np.float32)
+        incoming = np.zeros((total, 2), dtype=np.float32)
+        phase = np.linspace(0.0, 1.0, total, dtype=np.float32)
+        style = TransitionStyle("test", 8)
+
+        continuous = _blend(outgoing, incoming, phase, style=style,
+                            filter_state=ShelfCrossfadeState.create())
+        state = ShelfCrossfadeState.create()
+        parts, i = [], 0
+        for size in (700, 1, 333, 1024, 9):          # deliberately unaligned
+            j = min(i + size, total)
+            parts.append(_blend(outgoing[i:j], incoming[i:j], phase[i:j],
+                                style=style, filter_state=state))
+            i = j
+        parts.append(_blend(outgoing[i:], incoming[i:], phase[i:],
+                            style=style, filter_state=state))
+
+        np.testing.assert_allclose(np.concatenate(parts), continuous,
+                                   rtol=1e-5, atol=1e-5)
 
     def test_chunk_crossfade_uses_the_full_phase_ramp(self):
         n = 512

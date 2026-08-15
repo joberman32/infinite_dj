@@ -50,7 +50,7 @@ from .mixer import (
     _load_audio, _time_stretch, _apply_lowpass, _apply_highpass,
     _equal_power_fade, _apply_gain, _find_nearest_downbeat,
     _blend, _loudness_match, choose_transition_style,
-    TransitionPlan, CrossfadeFilterState, MAX_STRETCH, MASTER_LOUDNESS,
+    TransitionPlan, make_crossfade_state, MAX_STRETCH, MASTER_LOUDNESS,
     MIX_SR as SR
 )
 from .sequencer import build_compatibility_graph, sequence_energy_arc
@@ -282,7 +282,8 @@ def _build_crossfade_chunk(
     phase,                # scalar or per-sample values from 0.0 to 1.0
     sr: int = SR,
     style=None,
-    filter_state: Optional[CrossfadeFilterState] = None,
+    filter_state=None,      # CrossfadeFilterState or ShelfCrossfadeState,
+                            # whichever make_crossfade_state() built
 ) -> np.ndarray:
     """
     Render one chunk of the crossfade using the shared, style-aware EQ blend
@@ -644,7 +645,7 @@ class StreamEngine:
                 active_incoming = pending["incoming"]
                 active_style    = pending["style"]
                 active_filters  = (None if active_style.is_cut
-                                   else CrossfadeFilterState.create(SR))
+                                   else make_crossfade_state(SR))
                 self.state.is_mixing  = True
                 self.state.next_track = active_incoming
                 pending = None

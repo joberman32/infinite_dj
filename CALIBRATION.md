@@ -128,8 +128,36 @@ which sounds fine until you notice that's the same order as the quantity being
 measured. An earlier apparent success at recovering *band ordering* turned out to
 be luck: improving the low band's resolution flipped it.
 
-Pinned by `test_band_phase_does_not_track_cp`, which will fail if someone
-improves the estimator enough to make this viable.
+Pinned by `test_band_phase_does_not_track_cp_under_the_split_renderer`.
+
+### ⚠ Partially superseded (2026-08-15): it was the renderer, not the estimator
+
+The numbers above were produced by rendering the synthetic sweep through
+`_split3`'s band-split — which, it turned out, did not put the bass swap where
+its own automation said. The low lane deviated from the rendered result by up
+to 0.48 (CHANGELOG 2026-08-15). The estimator was hunting for a swap the
+renderer had smeared.
+
+Same estimator, same sweep, only the renderer changed:
+
+| renderer | true range | measured | compression |
+|---|---|---|---|
+| band-split (`EQ_TOPOLOGY="split"`) | 11.46 s | 4.21 s | **2.72x** |
+| shelving (`EQ_TOPOLOGY="shelf"`) | 11.46 s | 11.18 s | **1.02x** |
+
+The 4.21 s reproduces the 4.2 s above, so this is the same measurement that
+produced the finding. §4's threshold for widening calibration scope was "below
+~1.5x"; on synthetic mixes that is now met.
+
+**What this does not establish.** The fixture renders with an *idealised*
+shelf EQ. Real mixers have unknown corners and slopes, and a real DJ rides
+faders in ways `_make_profile` does not model, so this is an upper bound under
+ideal conditions — not a field result. Nothing here touches §3's blend-duration
+error (~25 beats), which is independent and still governs. Treat `cp` as
+**re-opened as a question, not recovered**: deciding it needs a sweep against
+mined mixes, which has not been run.
+
+Pinned by `test_shelf_renderer_makes_cp_recoverable_on_synthetic_mixes`.
 
 ## 5. What is honestly calibratable
 

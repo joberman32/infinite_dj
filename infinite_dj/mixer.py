@@ -346,6 +346,273 @@ class CrossfadeFilterState:
         return o_low, o_mid, o_high, i_low, i_mid, i_high
 
 
+# ── Shelving EQ (real DJ-mixer topology) ──────────────────────────────────────
+#
+# WHY THIS EXISTS. The `_split3` path above splits into three bands and re-sums
+# them with independent gains. That reconstructs perfectly at unity, but the
+# bands are causal IIR outputs with *different phase*, so they only cancel
+# correctly when their gains are equal. Scale them differently — which is the
+# entire point of a DJ EQ — and the crossover region misbehaves.
+#
+# Measured on `_blend` with a 60 Hz tone (see CHANGELOG 2026-08-15): at
+# crossfade phase 0.7 the bass-swap lane reads 0.00, meaning "outgoing bass
+# fully cut", yet 0.33 amplitude (-9.6 dB) of the outgoing kick survives —
+# it rides out on the *mid* band's envelope instead. Sweeping a tone through
+# the "low band killed" state boosts 80-200 Hz by up to +5 dB rather than
+# removing it. The single-source bass swap that the whole design rests on
+# ("only one kick ever plays") therefore does not happen.
+#
+# A real DJ mixer's EQ is not a band-split. It is a cascade of minimum-phase
+# shelving/peaking filters applied to the signal itself, where the magnitude
+# response *is* the intended curve — no re-summing, so nothing to mis-cancel.
+# That is what this section implements. (Topology idea from Vande Veire &
+# De Bie's auto-DJ; their code is AGPL, so this is a fresh implementation from
+# the published RBJ Audio EQ Cookbook formulas.)
+
+# Which EQ a crossfade uses when the caller doesn't supply a filter state:
+#   "shelf" — minimum-phase shelving cascade (this section); the bass swap works
+#   "split" — the legacy `_split3` band-split, kept reachable for A/B and
+#             because `CrossfadeFilterState` callers still select it explicitly
+EQ_TOPOLOGY = "shelf"
+
+SHELF_LOW_HZ  = LOW_CUT     # low-shelf corner (bass knob)
+SHELF_HIGH_HZ = MID_CUT     # high-shelf corner (treble knob)
+SHELF_MID_HZ  = float(np.sqrt(LOW_CUT * MID_CUT))  # ~721 Hz, geometric centre
+SHELF_MID_Q   = 0.50        # mid bell width (see the note below)
+SHELF_SLOPE   = 1.00        # RBJ shelf `S`: steepest that stays monotonic
+SHELF_STAGES  = 2           # identical shelves cascaded, each at 1/N of the dB
+EQ_FLOOR_DB   = -30.0       # a killed band is attenuated to this, not to -inf
+EQ_CTRL_HOP   = 512         # samples between coefficient updates (~12ms @44.1k)
+
+# SHELF_STAGES / EQ_FLOOR_DB were picked by measuring the transition width, not
+# by ear. Cascading N shelves at dB/N gives a steeper skirt than one shelf at
+# the full dB, so the kill reaches the kick without dragging the low-mids with
+# it. At matched bass attenuation (60 Hz -> 0.065):
+#
+#   1 x -24 dB   60Hz 0.067   400Hz 0.710   900Hz 0.981
+#   2 x -12 dB   60Hz 0.065   400Hz 0.813   900Hz 0.991   <- same kill, less collateral
+#
+# The floor is the depth at full kill. -30 dB puts the silenced kick ~30 dB
+# under the incoming one, comfortably masked, while costing only ~2.5 dB at
+# 400 Hz. Deeper floors buy inaudible extra kill for real low-mid loss
+# (2 x -20 dB: 60Hz 0.011 but 400Hz 0.619).
+#
+# SHELF_MID_Q trades how evenly the mid lane covers its 3.7-octave band
+# against how far the bell's skirts reach into its neighbours. Measured with
+# the mid lane at 0.5 (spread across 300-2400 Hz) and at full kill (60 Hz
+# survival when the mid alone is killed):
+#
+#   Q      mid spread     60Hz when mid killed
+#   0.35        0.22                      0.60
+#   0.50        0.31                      0.73   <- chosen
+#   0.70        0.38                      0.83
+#   1.00        0.43                      0.90
+#
+# Lower Q is flatter, and flatness is what runs constantly: the mid lane is
+# the *primary midrange crossfade*, so an uneven bell turns a level change
+# into a notch at 720 Hz. The collateral column only bites when the mid is
+# killed with both neighbours wide open, which the current profiles never
+# reach (their mid lead is <=0.50 while the bass swap completes at >=0.62).
+# 0.50 favours the case that always happens without going all the way to the
+# 0.30 a 3.7-octave bell would theoretically use, leaving headroom if someone
+# later adds a style with a much longer mid lead.
+
+
+def _biquad_low_shelf(sr: int, f0: float, gain_db: float,
+                      slope: Optional[float] = None) -> np.ndarray:
+    """RBJ low-shelf biquad as a single normalized SOS row."""
+    slope = SHELF_SLOPE if slope is None else slope
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * np.pi * f0 / sr
+    cw, sw = np.cos(w0), np.sin(w0)
+    alpha = sw / 2.0 * np.sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0)
+    tsa = 2.0 * np.sqrt(A) * alpha
+    b0 =        A * ((A + 1.0) - (A - 1.0) * cw + tsa)
+    b1 =  2.0 * A * ((A - 1.0) - (A + 1.0) * cw)
+    b2 =        A * ((A + 1.0) - (A - 1.0) * cw - tsa)
+    a0 =            ((A + 1.0) + (A - 1.0) * cw + tsa)
+    a1 =     -2.0 * ((A - 1.0) + (A + 1.0) * cw)
+    a2 =            ((A + 1.0) + (A - 1.0) * cw - tsa)
+    return np.array([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+
+
+def _biquad_high_shelf(sr: int, f0: float, gain_db: float,
+                       slope: Optional[float] = None) -> np.ndarray:
+    """RBJ high-shelf biquad as a single normalized SOS row."""
+    slope = SHELF_SLOPE if slope is None else slope
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * np.pi * f0 / sr
+    cw, sw = np.cos(w0), np.sin(w0)
+    alpha = sw / 2.0 * np.sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0)
+    tsa = 2.0 * np.sqrt(A) * alpha
+    b0 =        A * ((A + 1.0) + (A - 1.0) * cw + tsa)
+    b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cw)
+    b2 =        A * ((A + 1.0) + (A - 1.0) * cw - tsa)
+    a0 =            ((A + 1.0) - (A - 1.0) * cw + tsa)
+    a1 =      2.0 * ((A - 1.0) - (A + 1.0) * cw)
+    a2 =            ((A + 1.0) - (A - 1.0) * cw - tsa)
+    return np.array([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+
+
+def _biquad_peaking(sr: int, f0: float, gain_db: float,
+                    q: Optional[float] = None) -> np.ndarray:
+    """RBJ peaking-EQ biquad as a single normalized SOS row."""
+    q = SHELF_MID_Q if q is None else q
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * np.pi * f0 / sr
+    cw, sw = np.cos(w0), np.sin(w0)
+    alpha = sw / (2.0 * q)
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cw
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cw
+    a2 = 1.0 - alpha / A
+    return np.array([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0])
+
+
+def _n_sections() -> int:
+    """Biquads in one cascade: N low shelves + 1 mid bell + N high shelves."""
+    return 2 * SHELF_STAGES + 1
+
+
+def _shelf_sos(sr: int, g_low: float, g_mid: float, g_high: float) -> np.ndarray:
+    """
+    Build the EQ cascade for one set of *relative* band gains.
+
+    Gains are linear in [0, 1] (a DJ EQ cuts; it never boosts here). They are
+    relative — see `_split_overall`, which factors the common level out first —
+    so all-equal gains give an exactly flat cascade rather than three filters
+    that happen to cancel.
+
+    Each shelf is realised as `SHELF_STAGES` identical biquads at 1/N of the
+    requested dB, which is steeper than one biquad at the full dB (see the
+    measurements beside `SHELF_STAGES`). The mid stays a single bell: halving
+    a peaking filter's gain also changes its effective width, so the same
+    trick doesn't transfer cleanly.
+    """
+    def db(g):
+        return max(EQ_FLOOR_DB, 20.0 * np.log10(max(float(g), 1e-9)))
+    n = max(1, SHELF_STAGES)
+    low  = _biquad_low_shelf(sr, SHELF_LOW_HZ, db(g_low) / n)
+    high = _biquad_high_shelf(sr, SHELF_HIGH_HZ, db(g_high) / n)
+    return np.vstack([low] * n
+                     + [_biquad_peaking(sr, SHELF_MID_HZ, db(g_mid))]
+                     + [high] * n)
+
+
+def _split_overall(g_low: np.ndarray, g_mid: np.ndarray, g_high: np.ndarray) -> tuple:
+    """
+    Factor per-sample band lanes into (overall_level, relative band gains).
+
+    The lanes carry two things at once: how loud this track is overall, and how
+    it is shaped. A shelf cascade can only express the shaping — it bottoms out
+    at `EQ_FLOOR_DB` and can never reach true silence, yet the incoming track's
+    lanes are all 0.0 at phase 0 and it must contribute *nothing* rather than a
+    floor's worth of bleed. Pulling `overall = max(lanes)` out as a plain scalar
+    gain restores both exactness properties the band-split had for free:
+
+      - all lanes equal  -> flat cascade x overall   (no spectral colouring)
+      - all lanes zero   -> overall 0                (true digital silence)
+    """
+    overall = np.maximum.reduce([g_low, g_mid, g_high])
+    safe = np.maximum(overall, 1e-9)
+    return overall, g_low / safe, g_mid / safe, g_high / safe
+
+
+def _hop_segments(pos: int, n: int, hop: int):
+    """
+    Split a chunk into segments on the *global* control grid.
+
+    Segment boundaries are multiples of `hop` in absolute crossfade position,
+    never relative to this chunk. That is what keeps a real-time chunked render
+    sample-identical to one continuous offline render: where the producer
+    happens to cut its chunks cannot shift the coefficient-update grid.
+    """
+    i = 0
+    while i < n:
+        j = min(i + hop - ((pos + i) % hop), n)
+        yield i, j
+        i = j
+
+
+@dataclass
+class ShelfEQState:
+    """
+    Time-varying shelving EQ for one source, safe to drive in chunks.
+
+    Biquad coefficients are recomputed once per `EQ_CTRL_HOP` samples from the
+    automation lanes and held across the segment, with filter state (`zi`)
+    carried through — the same streaming discipline `CrossfadeFilterState`
+    uses. Coefficient updates every ~12 ms are far faster than the lanes move
+    (they traverse a whole 8-16 bar crossfade), so the automation stays smooth
+    without paying for per-sample coefficient computation in a recursive filter.
+    """
+    sr: int
+    hop: int
+    pos: int
+    zi: np.ndarray                      # (sections, 2 delay elems, 2 channels)
+    sos: Optional[np.ndarray] = None    # coefficients in force, carried across chunks
+
+    @classmethod
+    def create(cls, sr: int = MIX_SR, hop: int = EQ_CTRL_HOP):
+        return cls(sr=sr, hop=hop, pos=0,
+                   zi=np.zeros((_n_sections(), 2, 2), dtype=np.float64))
+
+    def process(self, audio: np.ndarray, g_low: np.ndarray,
+                g_mid: np.ndarray, g_high: np.ndarray) -> np.ndarray:
+        """Apply the automated EQ to `audio` given per-sample band lanes."""
+        from scipy.signal import sosfilt
+        n = len(audio)
+        if n == 0:
+            return audio
+        overall, r_low, r_mid, r_high = _split_overall(g_low, g_mid, g_high)
+        out = np.empty_like(audio, dtype=np.float32)
+        for i, j in _hop_segments(self.pos, n, self.hop):
+            # Recompute only when this segment begins on a true grid boundary.
+            # A chunk that starts mid-segment must keep using the coefficients
+            # derived at that segment's global start — which lies in an earlier
+            # chunk, so they have to be carried in state, exactly like `zi`.
+            # Sampling the lane at the chunk's own start instead would make the
+            # render depend on where the producer happened to cut its chunks.
+            if self.sos is None or (self.pos + i) % self.hop == 0:
+                self.sos = _shelf_sos(self.sr, r_low[i], r_mid[i], r_high[i])
+            filtered, self.zi = sosfilt(self.sos, audio[i:j], axis=0, zi=self.zi)
+            out[i:j] = filtered
+        self.pos += n
+        return (out * overall.reshape(-1, 1)).astype(np.float32)
+
+
+@dataclass
+class ShelfCrossfadeState:
+    """
+    The two `ShelfEQState`s of one crossfade, so the shelf topology plugs into
+    the same "create once per transition, pass to every chunk" contract the
+    engine already uses for `CrossfadeFilterState`.
+    """
+    out_eq: ShelfEQState
+    in_eq: ShelfEQState
+
+    @classmethod
+    def create(cls, sr: int = MIX_SR, hop: int = EQ_CTRL_HOP):
+        return cls(out_eq=ShelfEQState.create(sr, hop),
+                   in_eq=ShelfEQState.create(sr, hop))
+
+
+def make_crossfade_state(sr: int = MIX_SR):
+    """
+    The per-transition filter state matching the configured EQ topology.
+
+    Callers that stream a crossfade in chunks (the real-time engine) go through
+    this rather than naming a state class, so flipping `EQ_TOPOLOGY` switches
+    live playback and offline rendering together instead of leaving the engine
+    pinned to whichever class it happened to import.
+    """
+    if EQ_TOPOLOGY == "shelf":
+        return ShelfCrossfadeState.create(sr)
+    return CrossfadeFilterState.create(sr)
+
+
 # ── Crossfade shapes ──────────────────────────────────────────────────────────
 
 def _equal_power_fade(n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -746,14 +1013,36 @@ def _blend(
         phase = np.full(n, float(phase), dtype=np.float32)
     phase = phase[:n]
 
+    def lane(l):
+        return _sample_lane(l, phase)
+
+    def g(l):
+        return lane(l).reshape(-1, 1)
+
+    # Which EQ topology: an explicitly supplied state always wins (the caller
+    # has already committed to one for this transition), otherwise EQ_TOPOLOGY.
+    if isinstance(filter_state, ShelfCrossfadeState):
+        shelf_state = filter_state
+    elif filter_state is None and EQ_TOPOLOGY == "shelf":
+        shelf_state = ShelfCrossfadeState.create(sr)
+    else:
+        shelf_state = None
+
+    if shelf_state is not None:
+        # Minimum-phase shelving EQ: the magnitude response *is* the automation
+        # curve, so a killed band is genuinely gone rather than phase-shifted
+        # into its neighbour.
+        out_mix = g(prof.out_vol) * shelf_state.out_eq.process(
+            out_c, lane(prof.out_low), lane(prof.out_mid), lane(prof.out_high))
+        in_mix = g(prof.in_vol) * shelf_state.in_eq.process(
+            in_c, lane(prof.in_low), lane(prof.in_mid), lane(prof.in_high))
+        return (out_mix + in_mix).astype(np.float32)
+
     if filter_state is None:
         o_low, o_mid, o_high = _split3(out_c, sr)
         i_low, i_mid, i_high = _split3(in_c, sr)
     else:
         o_low, o_mid, o_high, i_low, i_mid, i_high = filter_state.split(out_c, in_c)
-
-    def g(lane):
-        return _sample_lane(lane, phase).reshape(-1, 1)
 
     # Each track = volume × (per-band gain × band), a 3-fader DJ EQ ridden by
     # the style's breakpoint automation.
