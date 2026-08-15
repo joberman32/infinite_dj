@@ -100,6 +100,7 @@ body {
    badge and an exit. */
 #livetag, #exitbtn { display: none; }
 .livetag { color: var(--fg); font-size: 11px; letter-spacing: .16em; flex: 1; }
+.livetag.paused { color: var(--dim); }
 #exitbtn { background: var(--bg); color: var(--dim); border: 1px solid var(--line2);
   cursor: pointer; font: inherit; font-size: 11px; letter-spacing: .12em; padding: 10px 14px; }
 #exitbtn:hover { color: var(--fg); border-color: var(--fg); }

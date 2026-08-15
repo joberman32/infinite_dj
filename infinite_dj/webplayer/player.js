@@ -228,6 +228,12 @@ function updateMeters() {
   let lvL = 0, lvR = 0;
   const live = RADIO ? (radio.playing && actx && actx.state === "running")
                      : !audio.paused;
+  // Same signal that gates the meters — so the badge and the meters can
+  // never disagree about whether audio is actually flowing.
+  if (RADIO) {
+    $("livetag").textContent = live ? "◉ LIVE" : "❚❚ PAUSED";
+    $("livetag").classList.toggle("paused", !live);
+  }
   if (analyserL && analyserR && live) {
     lvL = dbMeterLevel(rms(analyserL, meterBufL));
     lvR = dbMeterLevel(rms(analyserR, meterBufR));
