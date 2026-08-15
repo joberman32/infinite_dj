@@ -72,6 +72,7 @@ class PlaybackState:
     scheduled_out: Optional[CuePoint] = None
     total_played: float = 0.0      # total seconds played this session
     tracks_played: int = 0
+    gap_events: List[dict] = field(default_factory=list)  # completed audible gaps
 
 
 @dataclass
@@ -107,6 +108,21 @@ LOOKAHEAD_BARS = 16    # scheduler looks this many bars ahead for OUT cues
 # when a calibration corpus supplies them (see infinite_dj/calibration.py).
 MIN_DWELL_BARS = 32    # minimum bars to play before mixing out (let tracks breathe)
 MAX_DWELL_BARS = 96    # force transition after this many bars if none found
+
+# Gap / near-silence detection. A "gap" here means audio the listener can
+# actually hear go quiet — not a mid-track breakdown, which is deliberate.
+GAP_WARN_SECONDS  = 0.25    # true buffer-starvation silence this long is audible
+NEAR_SILENCE_DBFS = -45.0   # content below this level reads as "silent" at a boundary
+
+
+def _chunk_level_dbfs(chunk: np.ndarray) -> float:
+    """RMS level of an audio chunk in dBFS. -inf (as -120.0) for true silence."""
+    if chunk.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(np.square(chunk), dtype=np.float64)))
+    if rms <= 1e-9:
+        return -120.0
+    return 20.0 * np.log10(rms)
 
 
 def _dwell_bounds() -> tuple:
@@ -355,6 +371,11 @@ class StreamEngine:
         # File output mode
         self._output_chunks: List[np.ndarray] = []
 
+        # True-silence run tracking, for gap detection (see _record_playback).
+        self._silence_run_frames = 0
+        self._silence_run_started_at = 0.0
+        self._gap_warned = False
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self, first_track: Optional[TrackMeta] = None):
@@ -505,6 +526,29 @@ class StreamEngine:
         )
         self._preparation_thread.start()
 
+    def _maybe_reprepare_next(self, current: TrackMeta):
+        """Retry preparation for the already-selected next track if needed.
+
+        A failed preparation (an exception in the worker — a bad file, a
+        Rubber Band error) clears `_preparing_key` without ever setting
+        `_prepared_incoming`, and nothing retries it on its own. Left alone,
+        that silently pushes the eventual handoff onto
+        `_handle_track_end`'s synchronous-load fallback, which blocks the
+        producer thread mid-stream — the actual mechanism behind an audible
+        gap. Called every scheduler tick, well before the track ends, while
+        retrying is still cheap.
+        """
+        next_t, cue_in = self.state.next_track, self.state.next_cue_in
+        if next_t is None or cue_in is None:
+            return
+        is_ready = self._prepared_for(
+            current, TransitionEvent(next_t, cue_in)
+        ) is not None
+        is_preparing = (self._preparation_thread is not None
+                         and self._preparation_thread.is_alive())
+        if not is_ready and not is_preparing:
+            self._request_incoming_prepare(current, next_t, cue_in)
+
     def _prepared_for(self, current: TrackMeta, event: TransitionEvent) -> Optional[PreparedIncoming]:
         """Return prepared audio only when it belongs to this exact handoff."""
         with self._prepare_lock:
@@ -605,6 +649,21 @@ class StreamEngine:
                 self.state.next_track = active_incoming
                 pending = None
 
+                # Content-level check, independent of buffer health: if both
+                # sides of the handoff are already near-silent right where
+                # the crossfade starts, the transition itself will read as a
+                # gap even though audio is technically still flowing. This is
+                # legitimate for a deliberate "blend" between two sparse
+                # sections — logged as a heads-up, not corrected here.
+                probe_n = min(SR // 2, len(current_audio) - pos, len(in_audio) - in_pos)
+                if probe_n > 0:
+                    out_level = _chunk_level_dbfs(current_audio[pos:pos + probe_n])
+                    in_level  = _chunk_level_dbfs(in_audio[in_pos:in_pos + probe_n])
+                    if out_level < NEAR_SILENCE_DBFS and in_level < NEAR_SILENCE_DBFS:
+                        print(f"\n  ⚠ NEAR-SILENT TRANSITION: both sides of the "
+                              f"{active_style.name} into {active_incoming.title!r} "
+                              f"are quiet (out={out_level:.0f}dB, in={in_level:.0f}dB)")
+
             # Generate next chunk
             chunk_size = CHUNK_FRAMES
 
@@ -682,11 +741,48 @@ class StreamEngine:
         return out
 
     def _record_playback(self, requested_frames: int, actual_frames: int):
-        """Advance the audible/session clock from the consumer side only."""
+        """Advance the audible/session clock from the consumer side only.
+
+        Also tracks *true* silence — frames the ring buffer had nothing for,
+        so the callback emitted zeros. A single starved callback is usually
+        inaudible; a run of them is exactly "one track fades out and a gap
+        remains before the next starts". We accumulate consecutive shortfall
+        across calls and only surface it once it crosses GAP_WARN_SECONDS,
+        so normal jitter doesn't spam the log.
+        """
         self.state.playback_position += requested_frames / SR
         self.state.total_played = self.state.playback_position
-        if actual_frames < requested_frames:
+        missing = requested_frames - actual_frames
+
+        if missing > 0:
             self.state.underruns += 1
+            if self._silence_run_frames == 0:
+                self._silence_run_started_at = (
+                    self.state.playback_position - requested_frames / SR
+                )
+            self._silence_run_frames += missing
+            if (not self._gap_warned
+                    and self._silence_run_frames / SR >= GAP_WARN_SECONDS):
+                self._gap_warned = True
+                title = self.state.track.title if self.state.track else "?"
+                print(f"\n  ⚠ GAP: audio buffer starved during {title!r} "
+                      f"(mixing={self.state.is_mixing}) — still silent…")
+        elif self._silence_run_frames > 0:
+            run_seconds = self._silence_run_frames / SR
+            if run_seconds >= GAP_WARN_SECONDS:
+                event = {
+                    "at": round(self._silence_run_started_at, 2),
+                    "duration": round(run_seconds, 2),
+                    "track": self.state.track.title if self.state.track else None,
+                    "next_track": self.state.next_track.title if self.state.next_track else None,
+                    "was_mixing": self.state.is_mixing,
+                }
+                self.state.gap_events.append(event)
+                print(f"\n  ⚠ GAP ended: {event['duration']:.2f}s of silence "
+                      f"before {event['track']!r} "
+                      f"(next queued: {event['next_track']!r})")
+            self._silence_run_frames = 0
+            self._gap_warned = False
 
     def _handoff_native(self, in_native, in_pos, ratio, incoming):
         """
@@ -732,9 +828,27 @@ class StreamEngine:
             return self._current_audio, native_pos
 
         # This should only occur when no candidate could be preloaded (for
-        # example, a preparation error). Keep the engine alive, but the normal
-        # scheduler path above never performs this I/O on the producer thread.
+        # example, a preparation error) — the scheduler retry above exists
+        # specifically to keep us out of this branch. It blocks the producer
+        # thread on file I/O and time-stretching while the ring buffer keeps
+        # draining underneath it, which is the direct mechanism for an
+        # audible gap, so it's worth surfacing loudly and recording even
+        # though the consumer-side detector in `_record_playback` will also
+        # pick up the resulting underrun a moment later.
+        print(f"\n  ⚠ GAP RISK: no prepared audio for {next_t.title!r} — "
+              f"loading synchronously, producer thread will stall")
+        stall_start = time.time()
         self._current_audio = self._load_matched(next_t)
+        stall_seconds = time.time() - stall_start
+        if stall_seconds >= GAP_WARN_SECONDS:
+            self.state.gap_events.append({
+                "at": round(self.state.playback_position, 2),
+                "duration": round(stall_seconds, 2),
+                "track": current.title if current else None,
+                "next_track": next_t.title,
+                "was_mixing": False,
+                "source": "blocking_load",
+            })
         entry_pos = int(round((cue_in.timestamp if cue_in else 0.0) * SR))
         self._finish_transition(next_t)
         self.state.position = entry_pos / SR
@@ -783,6 +897,8 @@ class StreamEngine:
                         self.state.next_cue_in = cue_in
                     self._request_incoming_prepare(current, next_t, cue_in)
                     print(f"\n  ⏭  Up next: {next_t.title} [{next_t.key}]")
+            else:
+                self._maybe_reprepare_next(current)
 
             # 2. Check upcoming OUT cue points
             min_dwell, max_dwell = _dwell_bounds()

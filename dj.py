@@ -614,6 +614,17 @@ def cmd_play(args):
         mb = os.path.getsize(out_file) / 1024 / 1024 if os.path.exists(out_file) else 0
         print(f"\nDone. {out_file} ({mb:.1f} MB)")
 
+    gaps = engine.state.gap_events
+    if gaps:
+        total = sum(g["duration"] for g in gaps)
+        print(f"\n⚠ {len(gaps)} audible gap(s) this session, {total:.1f}s total:")
+        for g in gaps:
+            src = f" [{g['source']}]" if g.get("source") else ""
+            print(f"    {g['duration']:.2f}s before {g['track']!r}"
+                  f" (next queued: {g['next_track']!r}){src}")
+    else:
+        print("\n✓ No audible gaps this session.")
+
 
 # ── Mix-corpus mining ─────────────────────────────────────────────────────────
 

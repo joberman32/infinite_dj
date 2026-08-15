@@ -4,6 +4,50 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-14 — Gap detection for the real-time engine
+
+Added checks in `engine.py` so a live `play` session surfaces "one track
+fades out and a gap remains before the next starts" instead of it only being
+audible in the moment. Three independent detectors, since there are three
+different mechanisms that can produce it:
+
+- **True buffer starvation** (`_record_playback`): the ring buffer ran dry
+  and the audio callback emitted zeros. Consecutive shortfall across callback
+  calls is accumulated into a run; a run crossing `GAP_WARN_SECONDS` (0.25s)
+  is warned about live and recorded as a closed `gap_events` entry (with
+  duration, track, and next-queued track) once the buffer catches back up.
+  A single starved callback doesn't warn — only a sustained run does, so
+  ordinary scheduling jitter doesn't spam the log.
+- **Near-silent content at a transition boundary** (`_chunk_level_dbfs`
+  probe where a pending transition activates): if both the outgoing tail and
+  incoming head are below `NEAR_SILENCE_DBFS` (-45dBFS) right where the
+  crossfade starts, the whole crossfade will read as a gap even though audio
+  is technically flowing. This is legitimate for a deliberate `blend` between
+  two sparse sections, so it's logged as a heads-up rather than corrected.
+- **The synchronous fallback in `_handle_track_end`**: if no next track was
+  prepared in time, this path loads and time-stretches on the producer
+  thread itself — the one thread whose job is to keep the ring buffer fed.
+  That's the highest-risk path for a real, multi-second gap, so it now times
+  the blocking load and records a `gap_events` entry tagged
+  `"source": "blocking_load"` when it's slow.
+
+The actual root-cause fix is `_maybe_reprepare_next`, called every scheduler
+tick once a next track is selected: a failed background preparation (an
+exception in the worker — bad file, Rubber Band error) clears
+`_preparing_key` without ever setting `_prepared_incoming`, and nothing
+retried it before this change. Left alone, that silently pushed the handoff
+onto the blocking fallback above. Retrying here, well before the track ends,
+is what actually keeps the engine out of that branch — the three detectors
+above are instrumentation for when something still gets through, not a
+substitute for this.
+
+`cmd_play` now prints a session-end summary of `gap_events` (count + total
+seconds, or a clean "no audible gaps" line) so a run's health doesn't require
+scrolling back through the live log.
+
+Tests: `tests/test_engine_scheduling.py` — `GapDetectionTests`,
+`ReprepareOnFailureTests`, `BlockingFallbackGapTests`.
+
 ## 2026-08-14 — `fade`/`build` tie-break: deliberate draw instead of noise sign
 
 Follow-up to 2026-08-08's finding: `choose_transition_style` picked `fade` vs

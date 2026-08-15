@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -5,11 +7,14 @@ from io import StringIO
 import numpy as np
 
 from infinite_dj.engine import (
+    GAP_WARN_SECONDS,
+    SR,
     AudioRingBuffer,
     StreamEngine,
     TransitionEvent,
     _audible_track_position,
     _build_crossfade_chunk,
+    _chunk_level_dbfs,
     _crossfade_progress,
     _transition_start_time,
 )
@@ -183,6 +188,128 @@ class AudioRingBufferTests(unittest.TestCase):
         self.assertEqual(ring.read_into(out, 4), 2)
         np.testing.assert_array_equal(out[:2], np.ones((2, 2)))
         np.testing.assert_array_equal(out[2:], np.zeros((2, 2)))
+
+
+class GapDetectionTests(unittest.TestCase):
+    """Checks that catch 'one track fades to silence, then a gap remains'."""
+
+    def setUp(self):
+        self.current = track("current", [10.0])
+        self.incoming = track("incoming", [0.0])
+        self.engine = StreamEngine([self.current, self.incoming])
+        self.engine.state.track = self.current
+
+    def test_short_shortfall_is_not_reported(self):
+        # A few frames short, immediately followed by a full read: well
+        # under GAP_WARN_SECONDS, and shouldn't be treated as an audible gap.
+        self.engine._record_playback(requested_frames=100, actual_frames=90)
+        self.engine._record_playback(requested_frames=100, actual_frames=100)
+
+        self.assertEqual(self.engine.state.gap_events, [])
+
+    def test_sustained_starvation_is_recorded_once_with_its_duration(self):
+        chunk = int(GAP_WARN_SECONDS * SR / 2) + 1000  # two calls clears the threshold
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.engine._record_playback(requested_frames=chunk, actual_frames=0)
+            self.engine._record_playback(requested_frames=chunk, actual_frames=0)
+            # The run ends once the buffer is caught up again.
+            self.engine._record_playback(requested_frames=chunk, actual_frames=chunk)
+
+        self.assertEqual(len(self.engine.state.gap_events), 1)
+        event = self.engine.state.gap_events[0]
+        self.assertGreaterEqual(event["duration"], GAP_WARN_SECONDS)
+        self.assertEqual(event["track"], "current")
+        self.assertIn("GAP", output.getvalue())
+        # A second full read shouldn't duplicate the already-closed event.
+        self.engine._record_playback(requested_frames=chunk, actual_frames=chunk)
+        self.assertEqual(len(self.engine.state.gap_events), 1)
+
+    def test_chunk_level_dbfs_reads_true_silence_as_very_low(self):
+        silent = np.zeros((512, 2), dtype=np.float32)
+        loud = np.ones((512, 2), dtype=np.float32)
+
+        self.assertLess(_chunk_level_dbfs(silent), -100.0)
+        self.assertAlmostEqual(_chunk_level_dbfs(loud), 0.0, places=3)
+
+
+class ReprepareOnFailureTests(unittest.TestCase):
+    """A failed background preparation must be retried, not silently dropped."""
+
+    def setUp(self):
+        self.current = track("current", [10.0])
+        self.incoming = track("incoming", [0.0])
+        self.cue_in = CuePoint(0.0, "in", True, 0.5, 1.0)
+        self.engine = StreamEngine([self.current, self.incoming])
+        self.engine.state.track = self.current
+        self.engine.state.next_track = self.incoming
+        self.engine.state.next_cue_in = self.cue_in
+
+    def test_retries_when_nothing_is_prepared_and_no_worker_is_running(self):
+        calls = []
+        self.engine._request_incoming_prepare = lambda cur, inc, cue: calls.append(
+            (cur.file_path, inc.file_path)
+        )
+
+        self.engine._maybe_reprepare_next(self.current)
+
+        self.assertEqual(calls, [(self.current.file_path, self.incoming.file_path)])
+
+    def test_does_not_retry_while_a_preparation_is_already_in_flight(self):
+        release = threading.Event()
+
+        def slow_load(_track):
+            release.wait(timeout=1)
+            return np.zeros((64, 2), dtype=np.float32)
+
+        self.engine._load_matched = slow_load
+        self.engine._request_incoming_prepare(self.current, self.incoming, self.cue_in)
+
+        calls = []
+        real_request = self.engine._request_incoming_prepare
+        self.engine._request_incoming_prepare = lambda *a: (calls.append(a), real_request(*a))
+
+        self.engine._maybe_reprepare_next(self.current)
+        release.set()
+        self.engine._preparation_thread.join(timeout=1)
+
+        self.assertEqual(calls, [])
+
+    def test_does_not_retry_once_the_matching_preparation_is_ready(self):
+        self.engine._load_matched = lambda _t: np.zeros((64, 2), dtype=np.float32)
+        self.engine._request_incoming_prepare(self.current, self.incoming, self.cue_in)
+        self.engine._preparation_thread.join(timeout=1)
+
+        calls = []
+        self.engine._request_incoming_prepare = lambda cur, inc, cue: calls.append(1)
+
+        self.engine._maybe_reprepare_next(self.current)
+
+        self.assertEqual(calls, [])
+
+
+class BlockingFallbackGapTests(unittest.TestCase):
+    """The synchronous last-resort path in `_handle_track_end` must self-report."""
+
+    def test_records_a_gap_event_when_the_blocking_load_is_slow(self):
+        current = track("current", [10.0])
+        incoming = track("incoming", [0.0])
+        engine = StreamEngine([current, incoming])
+        engine.state.track = current
+
+        def slow_load(_t):
+            time.sleep(GAP_WARN_SECONDS + 0.05)
+            return np.zeros((64, 2), dtype=np.float32)
+
+        engine._load_matched = slow_load
+        output = StringIO()
+        with redirect_stdout(output):
+            engine._handle_track_end()
+
+        self.assertEqual(len(engine.state.gap_events), 1)
+        self.assertEqual(engine.state.gap_events[0]["source"], "blocking_load")
+        self.assertIn("GAP RISK", output.getvalue())
 
 
 if __name__ == "__main__":
