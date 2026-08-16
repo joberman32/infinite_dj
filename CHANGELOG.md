@@ -4,6 +4,50 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-15 — MFCC fallback: cue timbre similarity without installing CLAP
+
+`cue_cosine_similarity` — the function `find_best_cue_pair`,
+`choose_transition_style`'s textural-blend detection, and
+`library_sim_threshold` all key off — only ever had one signal to read:
+`CuePoint.embedding`, the 512D CLAP vector. CLAP is optional and dormant by
+default (needs `torch`/`transformers`, ~2GB), so on a fresh install every one
+of those consumers silently got `sim = None` and fell back to their
+no-similarity-data behavior. Nothing was broken, but a third of the design —
+"pick the transition style partly from how texturally similar the two cue
+points sound" — never actually ran unless CLAP had been separately installed.
+
+**The fix reuses machinery that already existed and was being thrown away.**
+`analyzer.py`'s section-novelty detector already computes a 13-coefficient
+MFCC array per track and discards it once the novelty curve is built. Added
+`get_mfcc_timbre()` (`infinite_dj/embeddings.py`) computing the same kind of
+vector on demand for a cue point: pooled mean+std of MFCC coefficients 1–12
+(dropping coefficient 0, which tracks loudness, not spectral shape — cue
+points already carry that separately as `.energy`) over the same OUT-looks-
+back/IN-looks-forward 8-second window `get_cue_embedding` uses for CLAP. No
+model to load, no optional dependency — librosa is already required.
+
+The vector is stored in a **new** `CuePoint.timbre` / `Section.timbre` field,
+not folded into `.embedding`. CLAP's 512D vectors and this 24D pooled-MFCC
+vector are different spaces; a library re-analyzed after installing CLAP
+would otherwise end up with some cue points in one space and some in the
+other, and cosine similarity between them is numerically valid but
+meaningless. `cue_cosine_similarity` now prefers `.embedding` when both cues
+have one, falls back to `.timbre` when neither does, and returns `None`
+(same as "no signal") if the two cues only have *different* kinds — it never
+compares across spaces.
+
+Because `find_best_cue_pair`, `choose_transition_style`, and
+`library_sim_threshold` all go through `cue_cosine_similarity` and nothing
+else, none of them needed to change. `library_sim_threshold` in particular
+already measures the *real* pairwise-similarity distribution of whatever
+vectors are actually populated and takes a percentile of it — so it
+re-calibrates itself automatically to the different similarity distribution
+MFCC vectors produce, with no separate tuning pass required.
+
+Existing analyzed tracks have neither field populated for anything beyond
+what they were analyzed with — `.timbre` only appears on cue points from a
+re-`analyze` run after this change.
+
 ## 2026-08-15 — Shelving EQ: the bass swap now actually swaps the bass
 
 **The bass swap did not work.** `_split3` splits into three bands and re-sums

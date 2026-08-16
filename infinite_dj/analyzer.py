@@ -324,15 +324,20 @@ def analyze_track(file_path: str, verbose: bool = True) -> TrackMeta:
 
     log(f"  Sections...", end=" ", flush=True)
     sections = _compute_sections(y, sr, energy_curve, duration)
-    # CLAP embedding of the timbre at each section start, so splice selection can
-    # choose structurally AND texturally distinct segments (optional — skipped
-    # when CLAP isn't installed).
-    try:
-        from .embeddings import get_cue_embedding
-        for s in sections:
+    # Timbre vector at each section start, so splice selection can choose
+    # structurally AND texturally distinct segments. CLAP (`.embedding`) is
+    # the high-quality path but optional and dormant by default; `.timbre`
+    # (pooled MFCC) always populates, so there's a working signal either way.
+    from .embeddings import get_cue_embedding, get_mfcc_timbre
+    for s in sections:
+        try:
             s.embedding = get_cue_embedding(y, sr, s.start, "in")
-    except Exception:
-        pass
+        except Exception:
+            pass
+        try:
+            s.timbre = get_mfcc_timbre(y, sr, s.start, "in")
+        except Exception:
+            pass
     log(f"{len(sections)} sections: {[s.label for s in sections]}")
 
     loudness = _compute_loudness(y)

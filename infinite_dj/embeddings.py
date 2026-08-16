@@ -1,8 +1,14 @@
 """
-CLAP Neural Audio Embedding Extractor.
+Timbre embedding extractors for cue points.
 
-Uses HuggingFace's ClapModel (laion/clap-htsat-fused) to extract 512D latent audio
-embeddings for the audio windows surrounding IN and OUT cue points.
+Two independent vector kinds, kept in separate CuePoint/Section fields so
+they're never cosine-compared against each other:
+  - `get_cue_embedding` / `CLAPExtractor` — 512D CLAP embeddings via
+    HuggingFace's ClapModel (laion/clap-htsat-fused). High-quality, optional
+    (needs `pip install -r requirements-clap.txt`), dormant by default.
+  - `get_mfcc_timbre` — pooled-MFCC vectors. Lower-fidelity but always
+    available (librosa is a hard dependency already), so it's what
+    `cue_cosine_similarity` actually has to work with on a fresh install.
 """
 
 import sys
@@ -137,6 +143,57 @@ class CLAPExtractor:
         except Exception as e:
             print(f"  [CLAP Error] Embedding extraction failed at t={timestamp:.1f}s: {e}", file=sys.stderr)
             return None
+
+
+def get_mfcc_timbre(
+    y: np.ndarray,
+    sr: int,
+    timestamp: float,
+    cue_type: str,
+    window_sec: float = 8.0,
+    n_mfcc: int = 13,
+) -> Optional[List[float]]:
+    """
+    Extract a lightweight timbre vector via pooled MFCCs — the fallback
+    similarity signal `cue_cosine_similarity` uses when no CLAP embedding is
+    present. No model to load, no optional dependency: librosa is already a
+    hard requirement of `analyzer.py`, so this always runs.
+
+    Same window convention as `extract_embedding` (OUT looks backward from
+    the cue, IN looks forward), so an OUT/IN pair from the same cue detector
+    pass describes matching audio if the two vector kinds are ever compared
+    side by side.
+
+    MFCC coefficient 0 is dropped before pooling: it tracks frame log-energy,
+    not spectral shape, and `CuePoint.energy` already carries that signal
+    separately — leaving it in would make a loud and a quiet passage of the
+    *same* instrumental read as texturally opposite.
+    """
+    duration = len(y) / sr
+    if cue_type == "out":
+        start_t = max(0.0, timestamp - window_sec)
+        end_t   = min(duration, timestamp)
+    else:  # "in" or default
+        start_t = max(0.0, timestamp)
+        end_t   = min(duration, timestamp + window_sec)
+
+    start_sample = int(round(start_t * sr))
+    end_sample   = int(round(end_t * sr))
+
+    segment = y[start_sample:end_sample]
+    if len(segment) == 0:
+        return None
+
+    if segment.ndim > 1:
+        segment = segment.mean(axis=1 if segment.shape[1] == 2 else 0)
+
+    try:
+        mfcc = librosa.feature.mfcc(y=segment, sr=sr, n_mfcc=n_mfcc)
+        pooled = np.concatenate([mfcc[1:].mean(axis=1), mfcc[1:].std(axis=1)])
+        return [round(float(v), 5) for v in pooled]
+    except Exception as e:
+        print(f"  [MFCC Warning] Timbre extraction failed at t={timestamp:.1f}s: {e}", file=sys.stderr)
+        return None
 
 
 def get_cue_embedding(

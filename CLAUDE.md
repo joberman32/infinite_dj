@@ -205,6 +205,7 @@ Camelot wheel scoring used by both `compatible` command and sequencer:
 - Energy: `energy_curve[]` — normalized RMS per second
 - Loudness: `loudness` — integrated RMS in dBFS (negative); used for gain-matching transitions
 - Structure: `sections[]` (Section: start/end/label/energy), `cue_points[]` (CuePoint: timestamp/type/phrase_aligned/energy/confidence)
+- Timbre: both Section and CuePoint carry `embedding` (512D CLAP vector, optional — needs `torch`/`transformers`) and `timbre` (24D pooled-MFCC vector, always populated). `cue_cosine_similarity` (`sequencer.py`) prefers `embedding`, falls back to `timbre`, never compares the two — see CHANGELOG 2026-08-15.
 
 ## Supported Audio Formats
 

@@ -207,12 +207,16 @@ def detect_cue_points(
     final_cues = sorted(outs + ins, key=lambda c: c.timestamp)
 
     if y is not None:
-        try:
-            from .embeddings import get_cue_embedding
-            for c in final_cues:
+        from .embeddings import get_cue_embedding, get_mfcc_timbre
+        for c in final_cues:
+            try:
                 c.embedding = get_cue_embedding(y, sr, c.timestamp, c.type)
-        except Exception:
-            pass
+            except Exception:
+                pass
+            try:
+                c.timbre = get_mfcc_timbre(y, sr, c.timestamp, c.type)
+            except Exception:
+                pass
 
     return final_cues
 

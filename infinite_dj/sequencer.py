@@ -18,11 +18,27 @@ from .harmony import camelot_compatibility, bpm_compatibility
 
 
 def cue_cosine_similarity(c1: CuePoint, c2: CuePoint) -> Optional[float]:
-    """Compute cosine similarity between two CuePoint embedding vectors."""
-    if not c1 or not c2 or not c1.embedding or not c2.embedding:
+    """
+    Cosine similarity between two cue points' timbre vectors.
+
+    Prefers the 512D CLAP `.embedding` when both cues have one; falls back to
+    the pooled-MFCC `.timbre` vector otherwise (populated on every analysis —
+    no extra install required, see infinite_dj/embeddings.py). The two vector
+    kinds are never mixed: if one cue only has CLAP and the other only has
+    MFCC, that's treated the same as neither having a vector, because cosine
+    similarity across two different embedding spaces is not a meaningful
+    number even though `np.dot` would happily compute one.
+    """
+    if not c1 or not c2:
         return None
-    v1 = np.array(c1.embedding, dtype=np.float32)
-    v2 = np.array(c2.embedding, dtype=np.float32)
+    if c1.embedding and c2.embedding:
+        v1 = np.array(c1.embedding, dtype=np.float32)
+        v2 = np.array(c2.embedding, dtype=np.float32)
+    elif c1.timbre and c2.timbre:
+        v1 = np.array(c1.timbre, dtype=np.float32)
+        v2 = np.array(c2.timbre, dtype=np.float32)
+    else:
+        return None
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     if norm1 == 0 or norm2 == 0:
@@ -37,7 +53,8 @@ def find_best_cue_pair(
 ) -> tuple[Optional[CuePoint], Optional[CuePoint], float]:
     """
     Find the optimal (cue_out, cue_in) pair between two tracks.
-    Uses CLAP vector similarity if available, combined with phrase alignment & confidence.
+    Uses cue timbre similarity (CLAP, or pooled MFCC as fallback) if available,
+    combined with phrase alignment & confidence.
     Returns (cue_out, cue_in, match_score).
     """
     outs = [c for c in track_out.cue_points if c.type == "out"]
@@ -91,7 +108,7 @@ class Sequence:
             dur = f"{int(t.duration//60)}:{int(t.duration%60):02d}"
             if i < len(self.edges):
                 e = self.edges[i]
-                sim_str = f" clap={e.cue_similarity:.2f}" if e.cue_similarity is not None else ""
+                sim_str = f" sim={e.cue_similarity:.2f}" if e.cue_similarity is not None else ""
                 arrow = f"→ harm={e.harmonic:.2f} rhythm={e.rhythmic:.2f}{sim_str} score={e.score:.2f}"
             else:
                 arrow = "(end)"
@@ -219,8 +236,8 @@ def _beatmatchable(a_bpm: float, b_bpm: float, max_stretch: float = 0.08) -> boo
 
 def _percentile_ranker(values):
     """
-    Return f(v) -> percentile of v within `values`, in [0, 1]. CLAP similarities
-    on a real library sit in a compressed band (e.g. 0.36–0.93, median ~0.77),
+    Return f(v) -> percentile of v within `values`, in [0, 1]. Cue-timbre
+    similarities on a real library sit in a compressed band (e.g. 0.36–0.93, median ~0.77),
     so a raw threshold barely discriminates; ranking against the library's own
     distribution turns it into a usable per-library signal.
     """
@@ -235,7 +252,8 @@ def _percentile_ranker(values):
 def library_sim_threshold(tracks: List[TrackMeta], pct: float = 85.0) -> Optional[float]:
     """
     A per-library "high textural similarity" cutoff: the given percentile of all
-    pairwise best-cue CLAP similarities. None if the library has no embeddings.
+    pairwise best-cue timbre similarities. None if the library has no embeddings
+    (CLAP or MFCC) on its cue points.
     """
     sims = []
     for i, a in enumerate(tracks):
@@ -262,7 +280,8 @@ def sequence_for_mixing(
     """
     Order tracks for a smooth mixed set: strongly prefer beat-matchable
     (tempo-compatible) neighbours so the render uses gentle blends rather than
-    hard cuts, while still respecting harmony, energy arc and timbre (CLAP).
+    hard cuts, while still respecting harmony, energy arc and cue timbre
+    (CLAP if installed, pooled MFCC otherwise).
 
     This is the sequencer `render-set` uses — it trades some energy-arc
     precision for far fewer jarring tempo cuts.
@@ -280,12 +299,12 @@ def sequence_for_mixing(
     graph = build_compatibility_graph(tracks)
     track_map = {t.file_path: t for t in tracks}
 
-    # Per-library CLAP ranker: turns the compressed similarity band into a
+    # Per-library timbre ranker: turns the compressed similarity band into a
     # discriminating [0,1] signal for timbral track selection (None if no
-    # embeddings, in which case CLAP simply doesn't contribute).
+    # embeddings at all, in which case timbre simply doesn't contribute).
     all_sims = [e.cue_similarity for edges in graph.values()
                 for e in edges if e.cue_similarity is not None]
-    clap_rank = _percentile_ranker(all_sims) if all_sims else None
+    sim_rank = _percentile_ranker(all_sims) if all_sims else None
 
     # Energy-arc target (same shapes as sequence_energy_arc)
     positions = np.linspace(0, 1, n)
@@ -331,11 +350,11 @@ def sequence_for_mixing(
         def score(e):
             t = track_map[e.track_b]
             # Beatmatchability dominates so the render avoids cuts; harmony,
-            # energy-arc fit, and timbral (CLAP) similarity break ties.
+            # energy-arc fit, and cue-timbre similarity break ties.
             bm = 1.0 if _beatmatchable(current.bpm, t.bpm, max_stretch) else 0.0
             s = 2.0 * bm + e.harmonic + 0.5 * energy_fit(t, pos)
-            if clap_rank is not None and e.cue_similarity is not None:
-                s += 0.75 * clap_rank(e.cue_similarity)
+            if sim_rank is not None and e.cue_similarity is not None:
+                s += 0.75 * sim_rank(e.cue_similarity)
             return s
 
         if stochastic and len(candidates) > 1:

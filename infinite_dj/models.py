@@ -16,6 +16,12 @@ class CuePoint:
     energy: float             # normalized RMS energy at this point (0-1)
     confidence: float         # composite score from cue detector (0-1)
     embedding: Optional[List[float]] = None  # 512D CLAP feature vector
+    timbre: Optional[List[float]] = None  # pooled-MFCC fallback vector, used
+                                           # when no CLAP embedding is present
+                                           # (see infinite_dj/embeddings.py) —
+                                           # a different vector space, kept in
+                                           # its own field so it's never
+                                           # cosine-compared against a CLAP one
 
     def to_dict(self):
         return self.__dict__
@@ -35,6 +41,7 @@ class Section:
                       # steady / falling / sparse / outro
     energy: float     # mean normalized RMS energy in this section
     embedding: Optional[List[float]] = None  # CLAP timbre vector at section start
+    timbre: Optional[List[float]] = None  # pooled-MFCC fallback, see CuePoint.timbre
 
     def to_dict(self):
         return self.__dict__
