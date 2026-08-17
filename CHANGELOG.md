@@ -4,6 +4,110 @@ This file records meaningful behavior and architecture changes, including why
 they were made. Read it before changing the mixing or playback pipeline: it
 captures constraints that may not be obvious from a local code path.
 
+## 2026-08-17 — Key-sync: pitch-shift the incoming track to fit the outgoing key
+
+Harmonic compatibility was a fixed property of two tracks: `camelot_compatibility`
+scored the pair and the sequencer worked around whatever it got. A real DJ has
+a pitch fader — they *move* a track to fit. This adds that.
+
+**Why small shifts work, which is not obvious.** Camelot hours step by 7
+semitones (the circle of fifths). 7 is coprime to 12, so every semitone offset
+lands on a *different* wheel offset — there's no "small shift, small wheel
+move" relationship, and a ±1 semitone shift measured against a track's OWN key
+lands 5-7 hours away, i.e. worse than doing nothing. But measured against an
+arbitrary *partner* key, a small shift routinely closes a large gap, because
+the partner may already sit exactly where that shift lands. Exhaustively, over
+all 552 ordered Camelot pairs:
+
+| | pairs |
+|---|---|
+| improve with some shift within ±3 semitones | **432 (78%)** |
+| of those, need only ±1 semitone | **240 (56%)** |
+| unshifted 0.0 (excluded by `MIN_SCORE`) | 336 |
+| …of those, rescued to ≥0.3 | **336 (all)** |
+
+Parallel major/minor (0.9) and reaching an exact key match from a non-matching
+start are structurally unreachable: pitch-shifting transposes, it never changes
+major↔minor. `pitch_shift_for_compatibility` returns `None` there rather than
+pretending. `tests/test_key_shift.py` pins this whole table so a change to
+`CAMELOT_MAP` or the scoring tiers can't silently invalidate the premise.
+
+Rendered through `_time_stretch(audio, sr, ratio, pitch_shift_semitones)`,
+which does tempo and pitch in **one** Rubber Band pass (`--tempo` + `--pitch` +
+`--formant`) — two passes would double the processing and compound each
+stage's quality loss. `--formant` keeps a shifted vocal's timbre so it doesn't
+chipmunk.
+
+### The bug this shipped with, and the test that caught it
+
+First cut applied the shift only to the crossfade region, mirroring how tempo
+already worked. That was wrong, and `test_mine_render_set.py` caught it —
+two probe tests that had nothing to do with this feature started failing
+because the render they measure had grown a spectral discontinuity.
+
+`render_set` deliberately stretches only the crossfade region and lets the
+incoming track resume its native tempo afterward (`cur_audio = nxt_audio`).
+For tempo that's an accepted tradeoff: a ~5% nudge at a phrase boundary. Reusing
+that shape for pitch meant the incoming track snapped back to its original key
+the instant the blend ended. Measured on a synthetic tone pair, isolating the
+incoming fundamental either side of the crossfade boundary:
+
+| | incoming fundamental |
+|---|---|
+| during crossfade (shifted +1) | 423.3 Hz |
+| immediately after | 400.0 Hz |
+| **jump at the boundary** | **-0.98 semitones** |
+
+A half-step lurch mid-track doesn't read as a modulation, it reads as out of
+tune — the feature made the mix *worse* at exactly the moment it was supposed
+to make it better. The unit tests all passed, because every one of them checked
+a single `_time_stretch` call in isolation; nothing exercised what happened
+after the crossfade. The probe test found it by measuring the rendered audio.
+
+**Fixed by keeping the shift for the track's whole time on air**, which is what
+a DJ actually does — set the key, leave it. Both renderers now hold a second
+whole-track pitch-shifted buffer to resume from (`render_set`'s
+`nxt_audio_after`, `PreparedIncoming.resume_audio()`). Same measurement after
+the fix: **+0.05 semitones** at the boundary (FFT bin resolution), and the track
+stays at 424.7 Hz instead of reverting to 400.
+
+Two consequences worth knowing:
+
+- **A key-synced transition costs two Rubber Band jobs, not one** — a combined
+  tempo+pitch pass for the crossfade region, and a pitch-only whole-track pass
+  for what plays after. Each buffer is still processed exactly once; the
+  crossfade region is never double-processed.
+
+  In the live engine those two passes run **concurrently**, which is not
+  cosmetic. Preparation has to finish inside the minimum dwell (32 bars), and
+  that budget shrinks as tempo rises: ~62 s at 124 BPM but only ~44 s at 174.
+  Measured on a 5.5-min track, the passes are 20.0 s and 11.9 s. Sequentially
+  that's 32.7 s — fine here, but it scales with track length, and a 10-min track
+  at 174 BPM comes to ~60 s against a 44 s budget. Overrunning doesn't degrade
+  gracefully: it falls through to `_handle_track_end`'s synchronous load, which
+  blocks the producer thread while the ring buffer drains — the exact mechanism
+  behind an audible gap (see 2026-08-14). Both passes are external subprocesses,
+  so running them on separate threads genuinely overlaps rather than fighting the
+  GIL, turning the cost into the slower of the two instead of the sum: 20.0 s
+  measured, and ~37 s for that 10-min worst case, back inside budget.
+- **The next transition has to plan against the key actually sounding.** A
+  track that was key-synced on the way in is no longer in its analyzed key, so
+  `transpose_key()` resolves what it became and that is threaded forward
+  (`plan_transition(out_key=…)`, `StreamEngine._current_key_offset`). Offsets
+  do **not** accumulate down a set: each shift is measured from that track's own
+  native key, not chained off the previous offset, so every track stays within
+  `MAX_KEY_SHIFT_SEMITONES` of how it was recorded and no clamp is needed.
+
+The sequencer scores shift-aware too (`CompatibilityEdge.key_shift_semitones`),
+docked by `KEY_SHIFT_PENALTY_PER_SEMITONE = 0.03` so a naturally compatible pair
+still outranks one that needs a shift to reach the same tier. It derives the
+shift from the same pure function on the same two keys as the renderer, so the
+two can't disagree without being threaded together explicitly.
+
+Known limitation: the engine's *track selection* still runs off the statically
+built compatibility graph, which uses analyzed keys. Selection is a preference
+ordering; the shift is the correction applied once a pair is chosen.
+
 ## 2026-08-15 — MFCC fallback: cue timbre similarity without installing CLAP
 
 `cue_cosine_similarity` — the function `find_best_cue_pair`,

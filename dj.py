@@ -495,7 +495,8 @@ def cmd_render_set(args):
     print(f"\n  Transitions:")
     for mk in markers:
         m, s = divmod(mk.time, 60)
-        detail = (f"{mk.style} {mk.stretch_pct:+.1f}%"
+        shift = f" key{mk.pitch_shift_semitones:+.0f}" if mk.pitch_shift_semitones else ""
+        detail = (f"{mk.style} {mk.stretch_pct:+.1f}%{shift}"
                   if mk.method == "beatmatch" else f"cut ({mk.style})")
         print(f"    {int(m)}:{s:04.1f}  [{detail}]  {mk.label[:50]}")
 

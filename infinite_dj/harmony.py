@@ -5,6 +5,8 @@ Key detection via Krumhansl-Schmuckler algorithm on chroma features.
 Camelot wheel for DJ-standard harmonic compatibility scoring.
 """
 
+from typing import Optional
+
 import numpy as np
 
 # Krumhansl-Schmuckler key profiles
@@ -146,6 +148,82 @@ def camelot_compatibility(key_a: str, key_b: str) -> float:
             return 0.5
 
     return 0.0
+
+
+# A pitch shift wide enough to matter but narrow enough to stay natural-
+# sounding on a full mixed track with vocals, even with Rubber Band's
+# formant preservation (`--formant`) fighting the "chipmunk" effect. Real DJ
+# hardware pitch faders commonly range +/-6-10%, in the same ballpark.
+MAX_KEY_SHIFT_SEMITONES = 3.0
+
+
+def transpose_key(key: str, n_steps: float) -> Optional[str]:
+    """
+    The Camelot key a track in `key` actually sounds in after being pitch-
+    shifted by `n_steps` semitones. None if the key is missing/unrecognized.
+
+    Pitch-shifting transposes; it never changes major<->minor, so the letter
+    (A/B) is preserved and only the root moves.
+
+    A key-synced track keeps playing in its shifted key for as long as it's on
+    air, so this is what the NEXT transition has to plan against — using the
+    analyzed key there would silently compare against a key nobody is hearing.
+    Each track's shift is measured from its OWN native key rather than chained
+    off the previous track's offset, so offsets never accumulate across a set:
+    every track stays within MAX_KEY_SHIFT_SEMITONES of how it was recorded.
+    """
+    if not key or key not in CAMELOT_REVERSE:
+        return None
+    root, is_major = CAMELOT_REVERSE[key]
+    return CAMELOT_MAP[((root + int(round(n_steps))) % 12, is_major)]
+
+
+def pitch_shift_for_compatibility(
+    key_a: str,
+    key_b: str,
+    max_semitones: float = MAX_KEY_SHIFT_SEMITONES,
+) -> Optional[tuple]:
+    """
+    Smallest integer semitone shift to key_b's track that improves its Camelot
+    compatibility with key_a, within `max_semitones`. None if either key is
+    missing/unrecognized, or no in-budget shift beats the unshifted score.
+
+    Camelot hours are semitones-mod-12 stepped by 7 (the circle of fifths).
+    7 is coprime to 12, so every semitone offset lands on a *different* wheel
+    offset -- there's no "small shift, small wheel move" relationship. Concr-
+    etely: a +/-1 semitone shift, compared against a track's OWN unshifted
+    key, lands 5-7 hours away (worse than doing nothing); but compared against
+    an arbitrary PARTNER key, a small shift routinely closes a large gap,
+    because the partner may already sit exactly 1-3 hours from where a small
+    shift lands key_b. Measured across all 552 ordered Camelot pairs: 78%
+    improve with some shift in +/-3 semitones, and among those, the median
+    needed shift is only +/-1 semitone (see tests/test_key_shift.py, which
+    pins this table so a change to CAMELOT_MAP or camelot_compatibility can't
+    silently invalidate it).
+
+    Ties (equal best score) break toward the smallest |n_steps| -- the least
+    audible alteration for the same harmonic benefit.
+    """
+    if not key_a or not key_b:
+        return None
+    if key_a not in CAMELOT_REVERSE or key_b not in CAMELOT_REVERSE:
+        return None
+
+    baseline = camelot_compatibility(key_a, key_b)
+    root_b, is_major_b = CAMELOT_REVERSE[key_b]
+
+    budget = int(max_semitones)
+    best = None   # (n_steps, shifted_key, score)
+    for n in range(-budget, budget + 1):
+        if n == 0:
+            continue
+        shifted_key = CAMELOT_MAP[((root_b + n) % 12, is_major_b)]
+        score = camelot_compatibility(key_a, shifted_key)
+        if score <= baseline:
+            continue
+        if best is None or score > best[2] or (score == best[2] and abs(n) < abs(best[0])):
+            best = (n, shifted_key, score)
+    return best
 
 
 def bpm_compatibility(bpm_a: float, bpm_b: float) -> float:

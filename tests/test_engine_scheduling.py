@@ -27,7 +27,7 @@ from infinite_dj.mixer import (
 from infinite_dj.models import CuePoint, TrackMeta
 
 
-def track(path: str, downbeats: list[float]) -> TrackMeta:
+def track(path: str, downbeats: list[float], key: str = "8A") -> TrackMeta:
     return TrackMeta(
         file_path=path,
         title=path,
@@ -37,8 +37,8 @@ def track(path: str, downbeats: list[float]) -> TrackMeta:
         beats=[],
         downbeats=downbeats,
         phrases=[],
-        key="8A",
-        key_name="A minor",
+        key=key,
+        key_name=key,
         key_confidence=1.0,
         energy_curve=[],
         sections=[],
@@ -95,6 +95,71 @@ class TransitionSchedulingTests(unittest.TestCase):
         self.assertIsNotNone(prepared)
         self.assertIs(prepared.native_audio, incoming_audio)
         self.assertEqual(prepared.stretched_start_frame, 0)
+
+    def test_live_prepare_picks_up_a_key_sync_shift(self):
+        """The same shift plan_transition would derive from the same two
+        keys, applied here off the real-time path — same tempos (ratio=1.0)
+        so this exercises the pitch-only branch specifically."""
+        current = track("current", [10.0, 12.0, 14.0, 16.0], key="8B")
+        incoming = track("incoming", [0.0], key="12B")
+        engine = StreamEngine([current, incoming])
+        incoming_audio = np.zeros((128, 2), dtype=np.float32)
+        engine._load_matched = lambda _: incoming_audio
+
+        engine._request_incoming_prepare(current, incoming, self.cue_in)
+        engine._preparation_thread.join(timeout=5)
+        event = TransitionEvent(incoming, self.cue_in)
+        prepared = engine._prepared_for(current, event)
+
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared.pitch_shift_semitones, 1.0)   # 8B -> 12B, see test_key_shift.py
+        self.assertEqual(prepared.ratio, 1.0)   # same BPM — isolates the pitch-only branch
+
+    def test_a_key_synced_track_resumes_from_shifted_audio_not_native(self):
+        """After the crossfade the track must keep its key-synced pitch.
+
+        Resuming from `native_audio` would snap it back to its original key
+        mid-track — audible, and the reason `shifted_audio`/`resume_audio()`
+        exist. See CHANGELOG 2026-08-17.
+        """
+        current = track("current", [10.0, 12.0, 14.0, 16.0], key="8B")
+        incoming = track("incoming", [0.0], key="12B")
+        engine = StreamEngine([current, incoming])
+        engine._load_matched = lambda _: np.zeros((128, 2), dtype=np.float32)
+
+        engine._request_incoming_prepare(current, incoming, self.cue_in)
+        engine._preparation_thread.join(timeout=10)
+        prepared = engine._prepared_for(current, TransitionEvent(incoming, self.cue_in))
+
+        self.assertEqual(prepared.pitch_shift_semitones, 1.0)
+        self.assertIsNotNone(prepared.shifted_audio)
+        self.assertIs(prepared.resume_audio(), prepared.shifted_audio)
+        self.assertIsNot(prepared.resume_audio(), prepared.native_audio)
+
+    def test_an_unshifted_track_resumes_from_native_audio(self):
+        """No shift means no second buffer and no extra Rubber Band pass."""
+        engine = StreamEngine([self.current, self.incoming])   # both key 8A
+        incoming_audio = np.zeros((128, 2), dtype=np.float32)
+        engine._load_matched = lambda _: incoming_audio
+
+        engine._request_incoming_prepare(self.current, self.incoming, self.cue_in)
+        engine._preparation_thread.join(timeout=5)
+        prepared = engine._prepared_for(
+            self.current, TransitionEvent(self.incoming, self.cue_in))
+
+        self.assertEqual(prepared.pitch_shift_semitones, 0.0)
+        self.assertIsNone(prepared.shifted_audio)
+        self.assertIs(prepared.resume_audio(), prepared.native_audio)
+
+    def test_the_effective_key_carries_into_the_next_transition(self):
+        """A key-synced track is no longer in its analyzed key, so the next
+        transition has to plan against what's actually sounding."""
+        engine = StreamEngine([self.current, self.incoming])
+        self.assertEqual(engine._current_key_offset, 0.0)
+
+        engine._finish_transition(self.incoming, 2.0)
+
+        self.assertEqual(engine._current_key_offset, 2.0)
 
     def test_track_end_uses_prepared_audio_without_loading_on_producer(self):
         engine = StreamEngine([self.current, self.incoming])

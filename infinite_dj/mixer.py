@@ -33,7 +33,7 @@ except ImportError:
     HAS_RUBBERBAND = False
 
 from .models import TrackMeta, CuePoint, Section
-from .harmony import camelot_compatibility
+from .harmony import camelot_compatibility, pitch_shift_for_compatibility, transpose_key
 
 # Full quality SR for output
 MIX_SR = 44100
@@ -59,6 +59,7 @@ class TransitionPlan:
     stretch_ratio: float = 1.0 # how much track_in is time-stretched
     beatmatched: bool = True   # False => tempos too far apart, do a cut
     method: str = "beatmatch"  # "beatmatch" | "cut"
+    pitch_shift_semitones: float = 0.0  # key-sync shift applied to track_in
 
     def __post_init__(self):
         if self.bpm_target == 0.0:
@@ -85,6 +86,15 @@ class TransitionPlan:
             self.stretch_ratio = 1.0
             self.beatmatched   = False
             self.method        = "cut"
+
+        # Key-sync: only worth it when the two tracks actually overlap in a
+        # beat-locked crossfade (a cut has no simultaneous harmonic content
+        # to clash, so there's nothing to fix).
+        self.pitch_shift_semitones = 0.0
+        if self.beatmatched:
+            shift = pitch_shift_for_compatibility(self.track_out.key, self.track_in.key)
+            if shift is not None:
+                self.pitch_shift_semitones = float(shift[0])
 
 
 @dataclass
@@ -119,27 +129,56 @@ def _time_to_samples(t: float, sr: int) -> int:
 
 # ── Time-stretching ───────────────────────────────────────────────────────────
 
-def _time_stretch(audio: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+def _time_stretch(audio: np.ndarray, sr: int, ratio: float,
+                  pitch_shift_semitones: float = 0.0) -> np.ndarray:
     """
-    Time-stretch audio by `ratio` without changing pitch.
+    Time-stretch audio by `ratio` and, optionally, pitch-shift it by
+    `pitch_shift_semitones` (key-sync, see harmony.pitch_shift_for_compatibility).
     ratio > 1.0 = slower (incoming track has lower BPM, stretch to match)
     ratio < 1.0 = faster (incoming track has higher BPM, compress)
 
-    Uses pyrubberband (Rubber Band Library) for best quality.
-    Falls back to librosa phase vocoder for ratios within 6%.
+    Both happen in a SINGLE Rubber Band pass when both are requested — two
+    separate passes would double the processing and compound each stage's own
+    quality loss, on top of the phase-mismatch a two-stage stretch/shift risks.
+    Pitch-shifted with `--formant` (formant preservation), so a shifted vocal
+    keeps its original timbre instead of "chipmunking".
+
+    Uses pyrubberband (Rubber Band Library) for best quality. Falls back to
+    librosa (mono, no formant preservation) when Rubber Band isn't installed.
     """
-    if abs(ratio - 1.0) < 0.001:
-        return audio  # No stretch needed
+    no_stretch = abs(ratio - 1.0) < 0.001
+    no_shift = abs(pitch_shift_semitones) < 0.001
+    if no_stretch and no_shift:
+        return audio  # Nothing to do
 
     if HAS_RUBBERBAND:
-        left  = rb.time_stretch(audio[:, 0], sr, ratio)
-        right = rb.time_stretch(audio[:, 1], sr, ratio)
+        if no_shift:
+            left  = rb.time_stretch(audio[:, 0], sr, ratio)
+            right = rb.time_stretch(audio[:, 1], sr, ratio)
+        else:
+            # rb.time_stretch() short-circuits on rate==1.0 before ever
+            # touching rbargs, so a pure pitch-shift (no tempo change) has to
+            # go through rb.pitch_shift() instead — its only guard is
+            # n_steps==0. Passing `--tempo` through rbargs there still gets
+            # both changes applied in the one rubberband invocation.
+            rbargs = {"--formant": ""}
+            if not no_stretch:
+                rbargs["--tempo"] = ratio
+            left  = rb.pitch_shift(audio[:, 0], sr, pitch_shift_semitones,
+                                   rbargs=dict(rbargs))
+            right = rb.pitch_shift(audio[:, 1], sr, pitch_shift_semitones,
+                                   rbargs=dict(rbargs))
         return np.stack([left, right], axis=1).astype(np.float32)
     else:
-        # Fallback: librosa phase vocoder (mono only, lower quality)
+        # Fallback: librosa phase vocoder (mono only, lower quality, no
+        # formant preservation on the pitch-shifted path).
         mono = audio.mean(axis=1)
-        stretched = librosa.effects.time_stretch(mono, rate=1.0/ratio)
-        stereo = np.stack([stretched, stretched], axis=1)
+        if not no_stretch:
+            mono = librosa.effects.time_stretch(mono, rate=1.0 / ratio)
+        if not no_shift:
+            mono = librosa.effects.pitch_shift(mono, sr=sr,
+                                               n_steps=pitch_shift_semitones)
+        stereo = np.stack([mono, mono], axis=1)
         return stereo.astype(np.float32)
 
 
@@ -1077,13 +1116,22 @@ def render_transition(plan: TransitionPlan, sr: int = MIX_SR) -> MixResult:
         audio_in, plan.track_in.loudness, plan.track_out.loudness
     )
 
-    # Time-stretch incoming track to match outgoing BPM (only when beatmatching)
-    if plan.beatmatched and abs(plan.stretch_ratio - 1.0) > 0.001:
-        pct = (plan.stretch_ratio - 1.0) * 100
-        print(f"  Time-stretching incoming track by {pct:+.1f}% to match {plan.bpm_target:.1f} BPM...")
-        audio_in = _time_stretch(audio_in, sr, plan.stretch_ratio)
+    # Time-stretch incoming track to match outgoing BPM, and key-sync it if a
+    # shift improves harmonic compatibility (only when beatmatching — a cut
+    # has no simultaneous harmonic content to fix). Combined in one pass.
+    needs_stretch = plan.beatmatched and abs(plan.stretch_ratio - 1.0) > 0.001
+    needs_shift = plan.beatmatched and abs(plan.pitch_shift_semitones) > 0.001
+    if needs_stretch or needs_shift:
+        if needs_stretch:
+            pct = (plan.stretch_ratio - 1.0) * 100
+            print(f"  Time-stretching incoming track by {pct:+.1f}% to match {plan.bpm_target:.1f} BPM...")
+        if needs_shift:
+            print(f"  Key-syncing incoming track by {plan.pitch_shift_semitones:+.0f} semitones...")
+        audio_in = _time_stretch(audio_in, sr, plan.stretch_ratio,
+                                 plan.pitch_shift_semitones)
         # A downbeat at native time d lands at d / ratio after stretching
-        # (ratio > 1 speeds the track up, so beats move earlier).
+        # (ratio > 1 speeds the track up, so beats move earlier). Pitch-shift
+        # doesn't move anything in time, so this stays valid alongside it.
         stretched_downbeats = [d / plan.stretch_ratio
                                for d in plan.track_in.downbeats]
     else:
@@ -1209,6 +1257,7 @@ class SetMarker:
     method: str            # "beatmatch" | "cut"
     stretch_pct: float
     style: str = ""        # transition style name
+    pitch_shift_semitones: float = 0.0  # key-sync shift applied to the incoming track
 
 
 def _best_out_cue_after(track: TrackMeta, min_t: float, max_t: float):
@@ -1394,6 +1443,7 @@ class TransitionPlanned:
     style: TransitionStyle
     ratio: float                  # out_bpm / in_bpm, half/double folded
     beatmatched: bool
+    pitch_shift_semitones: float = 0.0  # key-sync shift for track_in, 0 if none/not beatmatched
 
 
 def plan_transition(
@@ -1407,6 +1457,7 @@ def plan_transition(
     sim_threshold: float = 0.82,
     splice: Optional[tuple] = None,
     occurrence: int = 0,
+    out_key: Optional[str] = None,
 ) -> TransitionPlanned:
     """
     Choose the exit cue, entry cue and crossfade style for one A→B transition.
@@ -1414,6 +1465,11 @@ def plan_transition(
     Extracted from `render_set`'s loop so the same decisions can be replayed
     outside a render — the corpus validator compares these against what real DJs
     did, and the calibration report needs them without producing audio.
+
+    `out_key` overrides the outgoing track's analyzed key. A track that was
+    itself key-synced on the way in keeps playing in its shifted key, so the
+    set loop passes the key actually sounding; callers planning a one-off
+    transition can leave it None and get `track_out.key`.
 
     `read_t` is where the outgoing track is currently playing from and `dur_out`
     the length of its *loaded* audio (which differs slightly from the analyzed
@@ -1485,9 +1541,17 @@ def plan_transition(
         seed_extra=(track_out.file_path, track_in.file_path, occurrence),
     )
 
+    # ── Key-sync: only when there's an actual beat-locked overlap to fix ──────
+    pitch_shift_semitones = 0.0
+    if beatmatched:
+        shift = pitch_shift_for_compatibility(out_key or track_out.key, track_in.key)
+        if shift is not None:
+            pitch_shift_semitones = float(shift[0])
+
     return TransitionPlanned(cue_out=out_cue, cue_out_t=cue_out_t,
                              cue_in=in_cue, cue_in_t=cue_in_t,
-                             style=style, ratio=ratio, beatmatched=beatmatched)
+                             style=style, ratio=ratio, beatmatched=beatmatched,
+                             pitch_shift_semitones=pitch_shift_semitones)
 
 
 def render_set(
@@ -1552,6 +1616,12 @@ def render_set(
     cur_start = 0             # output sample where the current track became audible
     prev_fade_in = 0.0        # fade-in of the current track (from the previous xfade)
     pair_occurrence: dict = {}  # (out path, in path) -> times already transitioned
+    # Semitones the CURRENT track is being pitched by. A key-synced track keeps
+    # playing in its shifted key for its whole time on air, so the next
+    # transition has to plan against the key actually sounding — not the
+    # analyzed one. Measured from each track's own native key, so offsets
+    # never accumulate down the set.
+    cur_key_offset = 0.0
 
     for i in range(len(tracks) - 1):
         solo_start = written  # output sample where this track's solo begins
@@ -1572,8 +1642,10 @@ def render_set(
             sim_threshold=sim_threshold,
             splice=((min_seg_sec, max_seg_sec) if splice else None),
             occurrence=occurrence,
+            out_key=transpose_key(cur_t.key, cur_key_offset) if cur_key_offset else None,
         )
         ratio, beatmatched = planned.ratio, planned.beatmatched
+        pitch_shift = planned.pitch_shift_semitones
         out_cue, cue_out_t = planned.cue_out, planned.cue_out_t
         in_cue, style = planned.cue_in, planned.style
 
@@ -1596,18 +1668,35 @@ def render_set(
         cue_out_sample = min(cue_out_sample, max(read, len(cur_audio) - mix_out_s))
 
         if style.is_cut:
-            # Short time-based fade — no long overlap of unsynced tempos.
+            # Short time-based fade — no long overlap of unsynced tempos, so
+            # nothing simultaneous to key-sync either.
             out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
             in_mix  = nxt_audio[in_sample:in_sample + mix_out_s]
             ratio   = 1.0
+            pitch_shift = 0.0
         else:
             out_mix = cur_audio[cue_out_sample:cue_out_sample + mix_out_s]
             in_region = nxt_audio[in_sample:in_sample + n_bars * in_bar_s]
-            if beatmatched and abs(ratio - 1.0) > 0.001:
-                in_mix = _time_stretch(in_region, sr, ratio)   # → outgoing tempo
+            if beatmatched and (abs(ratio - 1.0) > 0.001 or abs(pitch_shift) > 0.001):
+                # ONE pass from the native audio: tempo and key together, so
+                # the crossfade region is never processed twice.
+                in_mix = _time_stretch(in_region, sr, ratio, pitch_shift)   # → outgoing tempo + key
             else:
                 ratio = 1.0
                 in_mix = in_region
+
+        # A key-synced track has to KEEP its new key once the crossfade ends —
+        # otherwise it snaps back to native the instant the blend finishes,
+        # which is a fully audible key jump mid-track (measured at -0.98
+        # semitones before this was fixed; see CHANGELOG 2026-08-17). Only the
+        # tempo stretch is per-transition, by design: a ~5% tempo nudge at a
+        # phrase boundary is the accepted tradeoff, a semitone is not.
+        # Pitch-shifting preserves duration exactly, so `read` keeps indexing
+        # the same sample positions as the native audio.
+        if abs(pitch_shift) > 0.001:
+            nxt_audio_after = _time_stretch(nxt_audio, sr, 1.0, pitch_shift)
+        else:
+            nxt_audio_after = nxt_audio
 
         m = min(len(out_mix), len(in_mix))
         out_mix, in_mix = out_mix[:m], in_mix[:m]
@@ -1632,6 +1721,7 @@ def render_set(
                 method="beatmatch" if beatmatched else "cut",
                 stretch_pct=(ratio - 1.0) * 100.0,
                 style=style.name,
+                pitch_shift_semitones=pitch_shift,
             ))
             master.append(xf)
             written += len(solo) + len(xf)
@@ -1652,10 +1742,12 @@ def render_set(
         cur_start = solo_start + len(solo)   # incoming enters at the crossfade start
         prev_fade_in = xf_len / sr
 
-        # ── Advance: incoming becomes current, continuing at its native tempo ──
+        # ── Advance: incoming becomes current, continuing at its native tempo
+        # but KEEPING any key-sync shift it entered with.
         consumed_in = int(round(m * ratio))
         cur_t     = nxt_t
-        cur_audio = nxt_audio
+        cur_audio = nxt_audio_after
+        cur_key_offset = pitch_shift
         read      = in_sample + consumed_in
 
         # Splice mode: stop once we've filled the target length.

@@ -14,7 +14,7 @@ from infinite_dj.models import CuePoint, Section, TrackMeta
 SR = 44100
 
 
-def _write_track(path, bpm: float, duration: float, seed: int) -> TrackMeta:
+def _write_track(path, bpm: float, duration: float, seed: int, key: str = "8A") -> TrackMeta:
     """A synthetic track with a real beat grid, cue points and an energy curve."""
     rng = np.random.default_rng(seed)
     n = int(duration * SR)
@@ -46,7 +46,7 @@ def _write_track(path, bpm: float, duration: float, seed: int) -> TrackMeta:
         bpm=bpm, bpm_confidence=0.9,
         beats=[round(k * beat, 3) for k in range(int(duration / beat))],
         downbeats=downbeats, phrases=phrases,
-        key="8A", key_name="A minor", key_confidence=0.8,
+        key=key, key_name=key, key_confidence=0.8,
         energy_curve=[round(0.3 + 0.4 * (i / max(1, int(duration))), 4)
                       for i in range(int(duration))],
         sections=[Section(start=0.0, end=duration, label="steady", energy=0.5)],
@@ -86,6 +86,8 @@ def test_plan_transition_reproduces_render_set(tmp_path):
         # render_set reports stretch as a percentage of the planned ratio.
         expected_pct = (planned.ratio - 1.0) * 100 if planned.beatmatched else 0.0
         assert abs(expected_pct - marker.stretch_pct) < 1e-6, f"ratio drift at {i}"
+        assert planned.pitch_shift_semitones == marker.pitch_shift_semitones, \
+            f"key-shift drift at {i}"
         read_t = planned.cue_in_t
 
 
@@ -140,3 +142,40 @@ def test_dur_out_shortens_the_available_exit_window(tmp_path):
     a, b = tracks[0], tracks[1]
     planned = plan_transition(a, b, 0.0, 40.0, min_solo_bars=1)
     assert planned.cue_out_t <= 40.0
+
+
+# ── Key-sync pitch shift ─────────────────────────────────────────────────────
+
+def test_a_beatmatched_transition_picks_up_a_key_sync_shift(tmp_path):
+    """8B and 12B are 4 Camelot steps apart (baseline 0.0) — +1 semitone on
+    the incoming track reaches an adjacent, compatible key (0.8)."""
+    a = _write_track(tmp_path / "a.wav", bpm=124.0, duration=60.0, seed=1, key="8B")
+    b = _write_track(tmp_path / "b.wav", bpm=124.0, duration=60.0, seed=2, key="12B")
+    planned = plan_transition(a, b, 0.0, a.duration, min_solo_bars=1)
+    assert planned.beatmatched
+    assert planned.pitch_shift_semitones == 1.0
+
+
+def test_render_set_applies_the_same_shift_plan_transition_predicted(tmp_path):
+    """The marker render_set writes must match what plan_transition predicts —
+    the exact parity this file exists to guard, extended to key-sync."""
+    tracks = [
+        _write_track(tmp_path / "a.wav", bpm=124.0, duration=150.0, seed=1, key="8B"),
+        _write_track(tmp_path / "b.wav", bpm=126.0, duration=150.0, seed=2, key="12B"),
+    ]
+    audio, sr, markers, clips = render_set(tracks, min_solo_bars=4)
+    assert len(markers) == 1
+
+    planned = plan_transition(tracks[0], tracks[1], 0.0, tracks[0].duration, min_solo_bars=4)
+    assert planned.pitch_shift_semitones != 0.0
+    assert markers[0].pitch_shift_semitones == planned.pitch_shift_semitones
+
+
+def test_a_cut_never_carries_a_key_sync_shift(tmp_path):
+    """No overlapping harmonic content on a cut, so nothing to key-sync —
+    even between keys a beatmatched pair would happily shift."""
+    a = _write_track(tmp_path / "a.wav", bpm=124.0, duration=60.0, seed=1, key="8B")
+    b = _write_track(tmp_path / "b.wav", bpm=170.0, duration=60.0, seed=2, key="12B")
+    planned = plan_transition(a, b, 0.0, a.duration, min_solo_bars=1)
+    assert not planned.beatmatched
+    assert planned.pitch_shift_semitones == 0.0

@@ -54,7 +54,8 @@ from .mixer import (
     MIX_SR as SR
 )
 from .sequencer import build_compatibility_graph, sequence_energy_arc
-from .harmony import camelot_compatibility, bpm_compatibility
+from .harmony import (camelot_compatibility, bpm_compatibility,
+                      pitch_shift_for_compatibility, transpose_key)
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -96,6 +97,16 @@ class PreparedIncoming:
     stretched_start_frame: int
     ratio: float
     beatmatched: bool
+    pitch_shift_semitones: float = 0.0  # key-sync shift baked into stretched_audio
+    # Whole track at its NATIVE tempo but carrying the key-sync shift — what
+    # the producer resumes from once the crossfade completes, so a key-synced
+    # track doesn't snap back to its original key mid-track. `native_audio`
+    # when there's no shift, so the no-shift path costs nothing extra.
+    shifted_audio: Optional[np.ndarray] = None
+
+    def resume_audio(self) -> np.ndarray:
+        """Audio to continue from after the crossfade (shifted if key-synced)."""
+        return self.native_audio if self.shifted_audio is None else self.shifted_audio
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -377,6 +388,11 @@ class StreamEngine:
         self._silence_run_started_at = 0.0
         self._gap_warned = False
 
+        # Semitones the CURRENT track is pitched by. A key-synced track keeps
+        # its shifted key for its whole time on air, so the next transition
+        # plans against the key actually sounding (see _finish_transition).
+        self._current_key_offset = 0.0
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self, first_track: Optional[TrackMeta] = None):
@@ -489,13 +505,68 @@ class StreamEngine:
             try:
                 native = self._load_matched(incoming)
                 ratio, beatmatched = _resolve_stretch(current.bpm, incoming.bpm)
-                if beatmatched and abs(ratio - 1.0) > 0.001:
-                    stretched = _time_stretch(native, SR, ratio)
+
+                # Key-sync: only when there's an actual beat-locked overlap to
+                # fix (a cut has no simultaneous harmonic content to clash).
+                # Compared against the key the outgoing track is ACTUALLY
+                # sounding in — it may itself have been key-synced on the way in.
+                pitch_shift = 0.0
+                if beatmatched:
+                    out_key = (transpose_key(current.key, self._current_key_offset)
+                               if self._current_key_offset else current.key)
+                    shift = pitch_shift_for_compatibility(out_key, incoming.key)
+                    if shift is not None:
+                        pitch_shift = float(shift[0])
+
+                # Key-synced tracks keep their new key after the crossfade —
+                # snapping back to native would be an audible key jump
+                # mid-track. Pitch-shifting preserves duration, so native
+                # frame positions stay valid against this buffer.
+                #
+                # Run it CONCURRENTLY with the crossfade pass rather than after.
+                # Both are Rubber Band subprocesses, so they genuinely overlap
+                # (no GIL contention), turning the cost from the sum of the two
+                # into the slower of them. That matters: preparation has to
+                # finish inside the minimum dwell (32 bars — ~62s at 124 BPM but
+                # only ~44s at 174), and measured on a 5.5-min track the two
+                # passes are 20.0s + 11.9s. Sequentially a long track at a fast
+                # tempo would overrun the budget and fall through to
+                # `_handle_track_end`'s blocking load, which stalls the producer
+                # — the exact mechanism behind an audible gap.
+                shifted_box = {}
+                shift_worker = None
+                if abs(pitch_shift) > 0.001:
+                    def _make_shifted():
+                        try:
+                            shifted_box["audio"] = _time_stretch(native, SR, 1.0, pitch_shift)
+                        except Exception as exc:      # noqa: BLE001 - reported below
+                            shifted_box["error"] = exc
+                    shift_worker = threading.Thread(
+                        target=_make_shifted, name="infinite-dj-prep-shift", daemon=True)
+                    shift_worker.start()
+
+                if beatmatched and (abs(ratio - 1.0) > 0.001 or abs(pitch_shift) > 0.001):
+                    stretched = _time_stretch(native, SR, ratio, pitch_shift)
                     stretched_downbeats = [d / ratio for d in incoming.downbeats]
                 else:
                     ratio = 1.0
+                    pitch_shift = 0.0
                     stretched = native
                     stretched_downbeats = list(incoming.downbeats)
+
+                if shift_worker is not None:
+                    shift_worker.join()
+                shifted = shifted_box.get("audio")
+                if shift_worker is not None and shifted is None:
+                    # The crossfade buffer already has the shift baked in, so
+                    # there's no cheap way to undo it here and no time to redo
+                    # it. Resuming from native means one audible key snap at
+                    # the end of this crossfade — bad, but strictly better than
+                    # stalling the producer. Say so rather than degrading
+                    # silently.
+                    print(f"\n  ⚠ KEY-SYNC RESUME FAILED for {incoming.title!r} "
+                          f"({shifted_box.get('error')}) — this transition will "
+                          f"snap back {-pitch_shift:+.0f} semitones when it ends")
 
                 in_bar = (60.0 / incoming.bpm) * 4
                 aligned_t = _find_nearest_downbeat(
@@ -511,6 +582,8 @@ class StreamEngine:
                     stretched_start_frame=int(aligned_t * SR),
                     ratio=ratio,
                     beatmatched=beatmatched,
+                    pitch_shift_semitones=pitch_shift,
+                    shifted_audio=shifted,
                 )
                 with self._prepare_lock:
                     if self._preparing_key == key:
@@ -578,6 +651,7 @@ class StreamEngine:
         xfade_total     = 0      # total crossfade frames
         xfade_done      = 0      # frames completed in crossfade
         active_ratio    = 1.0    # stretch applied to the incoming crossfade
+        active_pitch    = 0.0    # key-sync shift applied to the incoming track
         active_incoming = None
         active_style    = None   # TransitionStyle for the current crossfade
         active_filters  = None   # persistent EQ state during a crossfade
@@ -611,10 +685,15 @@ class StreamEngine:
                     style = choose_transition_style(
                         evt.cue_out, evt.cue_in, prepared.beatmatched
                     )
-                    if prepared.beatmatched and abs(prepared.ratio - 1.0) > 0.001:
-                        print(f"\n  ⟶ Transition [{style.name}] to: {inc.title} "
-                              f"({(prepared.ratio-1.0)*100:+.1f}% tempo)")
-                    elif not prepared.beatmatched:
+                    if prepared.beatmatched:
+                        bits = []
+                        if abs(prepared.ratio - 1.0) > 0.001:
+                            bits.append(f"{(prepared.ratio-1.0)*100:+.1f}% tempo")
+                        if abs(prepared.pitch_shift_semitones) > 0.001:
+                            bits.append(f"{prepared.pitch_shift_semitones:+.0f} semitones")
+                        detail = f" ({', '.join(bits)})" if bits else ""
+                        print(f"\n  ⟶ Transition [{style.name}] to: {inc.title}{detail}")
+                    else:
                         print(f"\n  ⟶ Transition [cut] to: {inc.title} (tempos too far apart)")
 
                     bar_frames = int((60.0 / self.state.track.bpm) * 4 * SR)
@@ -625,9 +704,12 @@ class StreamEngine:
                     pending = {
                         "incoming":     inc,
                         "in_stretched": prepared.stretched_audio,
-                        "in_native":    prepared.native_audio,
+                        # Resume buffer: carries the key-sync shift when there
+                        # is one, so the track doesn't snap back mid-flight.
+                        "in_native":    prepared.resume_audio(),
                         "in_pos":       prepared.stretched_start_frame,
                         "ratio":        prepared.ratio,
+                        "pitch_shift":  prepared.pitch_shift_semitones,
                         "style":        style,
                         "xfade_total":  max(1, xfade_total_frames),
                         "start_frame":  int(round(start_t * SR)),
@@ -642,6 +724,7 @@ class StreamEngine:
                 xfade_total     = pending["xfade_total"]
                 xfade_done      = 0
                 active_ratio    = pending["ratio"]
+                active_pitch    = pending["pitch_shift"]
                 active_incoming = pending["incoming"]
                 active_style    = pending["style"]
                 active_filters  = (None if active_style.is_cut
@@ -677,7 +760,8 @@ class StreamEngine:
                 if actual <= 0:
                     # Ran out — hand off to incoming at native tempo
                     current_audio, pos = self._handoff_native(
-                        in_native, in_pos, active_ratio, active_incoming)
+                        in_native, in_pos, active_ratio, active_incoming,
+                        active_pitch)
                     in_audio = in_native = None
                     self.state.is_mixing = False
                     continue
@@ -704,7 +788,8 @@ class StreamEngine:
                 if xfade_done >= xfade_total:
                     # Crossfade complete — continue incoming at its native tempo
                     current_audio, pos = self._handoff_native(
-                        in_native, in_pos, active_ratio, active_incoming)
+                        in_native, in_pos, active_ratio, active_incoming,
+                        active_pitch)
                     in_audio = in_native = None
                     active_filters = None
                     self.state.is_mixing = False
@@ -785,27 +870,36 @@ class StreamEngine:
             self._silence_run_frames = 0
             self._gap_warned = False
 
-    def _handoff_native(self, in_native, in_pos, ratio, incoming):
+    def _handoff_native(self, in_native, in_pos, ratio, incoming, pitch_shift=0.0):
         """
         After a crossfade completes, continue the incoming track at its own
-        native tempo (the crossfade region was stretched to the outgoing tempo).
+        native tempo (the crossfade region was stretched to the outgoing tempo)
+        but KEEPING any key-sync shift — `in_native` is the resume buffer, which
+        carries the shift when there is one. Only tempo is per-transition: a ~5%
+        tempo nudge at a phrase boundary is the accepted tradeoff, a semitone
+        jump mid-track is not.
         Returns (current_audio, pos) for the producer to resume from.
         """
-        self._finish_transition(incoming)
+        self._finish_transition(incoming, pitch_shift)
         native_pos = int(round(in_pos * ratio))   # stretched frame → native frame
         return in_native, native_pos
 
-    def _finish_transition(self, incoming: TrackMeta):
+    def _finish_transition(self, incoming: TrackMeta, pitch_shift: float = 0.0):
         """Called when a crossfade completes."""
         self.state.track        = incoming
         self.state.next_track   = None
         self.state.next_cue_in  = None
         self.state.scheduled_out = None
+        # The key this track is actually sounding in for its whole time on air,
+        # which is what the NEXT transition has to plan against.
+        self._current_key_offset = pitch_shift
         self._recently_played.append(incoming.file_path)
         self.state.tracks_played += 1
         if self.on_track_change:
             self.on_track_change(incoming)
-        print(f"\n  ✓ Now playing: {incoming.title} [{incoming.key}, {incoming.bpm:.0f} BPM]")
+        sounding = transpose_key(incoming.key, pitch_shift) if pitch_shift else incoming.key
+        key_str = (f"{incoming.key}→{sounding}" if pitch_shift else incoming.key)
+        print(f"\n  ✓ Now playing: {incoming.title} [{key_str}, {incoming.bpm:.0f} BPM]")
 
     def _handle_track_end(self) -> tuple[np.ndarray, int]:
         """Track ran out with no scheduled transition. Pick next immediately."""
@@ -823,8 +917,9 @@ class StreamEngine:
         prepared = self._prepared_for(current, event) if event else None
         if prepared is not None:
             native_pos = int(round(prepared.stretched_start_frame * prepared.ratio))
-            self._current_audio = prepared.native_audio
-            self._finish_transition(next_t)
+            # Resume buffer keeps any key-sync shift (see PreparedIncoming).
+            self._current_audio = prepared.resume_audio()
+            self._finish_transition(next_t, prepared.pitch_shift_semitones)
             self.state.position = native_pos / SR
             return self._current_audio, native_pos
 

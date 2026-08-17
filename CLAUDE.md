@@ -155,6 +155,7 @@ back to the constant it replaced, and rendering is byte-identical — pinned by
 - Loudness-matched to a fixed `MASTER_LOUDNESS` target
 - **Stretch budget** (`MAX_STRETCH = 0.08`, half/double aware); beyond budget → `cut`
 - Time-stretch via Rubber Band; a downbeat at native time `d` maps to `d / ratio` after stretching (ratio > 1 speeds up)
+- **Key-sync pitch shift**: `_time_stretch(audio, sr, ratio, pitch_shift_semitones)` applies tempo and key-sync in a **single** Rubber Band pass (`--tempo` + `--pitch` + `--formant`) — never two separate passes, which would double the processing and compound each stage's quality loss. The shift itself is decided once, by `harmony.pitch_shift_for_compatibility`, and threaded through `TransitionPlan`/`TransitionPlanned`/`PreparedIncoming` from that single source — see Harmonic compatibility above. A key-synced transition costs **two** Rubber Band jobs, not one: a combined tempo+pitch pass for the crossfade region, plus a pitch-only whole-track pass for the audio played after it. Each buffer is processed exactly once — the crossfade region is never double-processed. Pitch-shifting preserves duration exactly, so native frame positions stay valid against the shifted buffer.
 
 ### Full-set rendering (`render_set` in `mixer.py`)
 - Lays all tracks on ONE continuous timeline: each plays solo at its native tempo, consecutive tracks overlap only during an adaptive crossfade, only the final track fades out. No silence gaps, no double-rendered tracks.
@@ -190,9 +191,12 @@ from `calibration.py` and falls back to the constants above.
 Camelot wheel scoring used by both `compatible` command and sequencer:
 - Same key: 1.0 | Parallel major/minor: 0.9 | ±1 step: 0.8 | ±2 steps: 0.6 | ±3 steps: 0.3
 - Cross-mode (A↔B) within ±1 step: 0.5 | else: 0.0
+- **Key-sync pitch shift** (`pitch_shift_for_compatibility`, `MAX_KEY_SHIFT_SEMITONES = 3.0`): Camelot steps are 7 semitones apart (circle of fifths, coprime to 12), so small pitch shifts don't map to small wheel moves — but they routinely close a large gap to an arbitrary partner key. 78% of all ordered Camelot pairs improve within ±3 semitones; the median needed shift is only ±1. Parallel major/minor (0.9) and an exact key match (1.0 from a non-matching start) are structurally unreachable — pitch-shifting transposes, it never changes major↔minor. Only applied when a transition is beatmatched (a cut has no simultaneous harmonic content to fix); rendered via `mixer._time_stretch`'s combined pass with `--formant` so vocals don't chipmunk.
+- ⚠ **A key-synced track keeps its shifted key for its whole time on air** — it must not revert when the crossfade ends. Unlike tempo (deliberately per-transition: each track resumes its native tempo after the blend, a ~5% nudge at a phrase boundary), a pitch revert is a *fully audible key jump mid-track*, measured at -0.98 semitones before this was fixed. So both renderers keep a second whole-track pitch-shifted buffer to resume from (`render_set`'s `nxt_audio_after`, `PreparedIncoming.resume_audio()`), and `transpose_key()` gives the key that track is now actually sounding in, which the NEXT transition plans against (`plan_transition(out_key=…)`, `StreamEngine._current_key_offset`). Each shift is measured from a track's own native key rather than chained off the previous offset, so offsets never accumulate across a set. See CHANGELOG 2026-08-17.
 
 ### Sequencing (`sequencer.py`)
 - Compatibility graph edge: `0.6 × harmonic_score + 0.4 × bpm_compatibility`
+- `harmonic_score` uses the key-sync-improved score when a shift helps, docked by `KEY_SHIFT_PENALTY_PER_SEMITONE = 0.03` per semitone so a naturally-compatible pair still outranks a shifted one at the same nominal tier. `CompatibilityEdge.key_shift_semitones` records which shift (if any) the score assumes — `mixer.plan_transition` derives the identical shift from the same two keys independently (same pure function, same inputs), so the two never disagree without needing to be threaded together explicitly.
 - `MIN_SCORE = 0.3` — minimum to add an edge
 - Arc shapes: `peak` (build to peak then down), `steady`, `build`, `wave`
 

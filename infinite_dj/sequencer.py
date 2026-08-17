@@ -14,7 +14,15 @@ from typing import List, Optional, Dict
 import numpy as np
 
 from .models import TrackMeta, CuePoint
-from .harmony import camelot_compatibility, bpm_compatibility
+from .harmony import camelot_compatibility, bpm_compatibility, pitch_shift_for_compatibility
+
+# Docked from a key-sync shift's improved harmonic score so a naturally
+# compatible pair still outranks a shifted one at the same nominal tier —
+# small enough that it never erases the improvement itself: the smallest gap
+# between any two camelot_compatibility tiers is 0.1 (0.5 -> 0.6), and the
+# maximum shift budget is 3 semitones, so the worst case (0.09 docked) still
+# nets a gain. See tests/test_key_shift.py.
+KEY_SHIFT_PENALTY_PER_SEMITONE = 0.03
 
 
 def cue_cosine_similarity(c1: CuePoint, c2: CuePoint) -> Optional[float]:
@@ -89,10 +97,11 @@ def find_best_cue_pair(
 class CompatibilityEdge:
     track_a: str   # file_path
     track_b: str
-    harmonic: float
+    harmonic: float             # possibly key-sync-improved, see key_shift_semitones
     rhythmic: float
     score: float   # weighted composite
     cue_similarity: Optional[float] = None
+    key_shift_semitones: Optional[float] = None  # set when `harmonic` assumes a pitch shift
 
 
 @dataclass
@@ -109,7 +118,9 @@ class Sequence:
             if i < len(self.edges):
                 e = self.edges[i]
                 sim_str = f" sim={e.cue_similarity:.2f}" if e.cue_similarity is not None else ""
-                arrow = f"→ harm={e.harmonic:.2f} rhythm={e.rhythmic:.2f}{sim_str} score={e.score:.2f}"
+                shift_str = (f" key{e.key_shift_semitones:+.0f}"
+                            if e.key_shift_semitones else "")
+                arrow = f"→ harm={e.harmonic:.2f}{shift_str} rhythm={e.rhythmic:.2f}{sim_str} score={e.score:.2f}"
             else:
                 arrow = "(end)"
             print(f"  {i+1:>2}. [{t.key} {t.bpm:.0f}bpm {dur}] {t.title[:40]}")
@@ -135,6 +146,20 @@ def build_compatibility_graph(
             harm   = camelot_compatibility(a.key, b.key)
             rhythm = bpm_compatibility(a.bpm, b.bpm)
 
+            # Key-sync: b can be pitch-shifted onto a better Camelot match at
+            # render time (mixer.plan_transition derives the exact same shift
+            # from the same two keys, so this and the render never disagree).
+            # Docked by KEY_SHIFT_PENALTY_PER_SEMITONE so an already-compatible
+            # pair still outranks one that needs a shift to reach it.
+            key_shift = None
+            shift = pitch_shift_for_compatibility(a.key, b.key)
+            if shift is not None:
+                n_steps, _, shifted_score = shift
+                penalized = shifted_score - KEY_SHIFT_PENALTY_PER_SEMITONE * abs(n_steps)
+                if penalized > harm:
+                    harm = penalized
+                    key_shift = float(n_steps)
+
             c_out, c_in, _ = find_best_cue_pair(a, b)
             sim = cue_cosine_similarity(c_out, c_in) if (c_out and c_in) else None
 
@@ -150,6 +175,7 @@ def build_compatibility_graph(
                 rhythmic=round(rhythm, 3),
                 score=round(score, 3),
                 cue_similarity=sim,
+                key_shift_semitones=key_shift,
             ))
 
         # Sort edges by score descending
